@@ -27,6 +27,13 @@ brew ua auto
 3. **Upgrade one by one** – download then install each selected package individually; errors do not block others
 4. **brew cleanup** – remove old versions
 
+## Uninstall
+
+```bash
+brew uninstall brew-update-all
+brew untap yingshu0218/update-all
+```
+
 ## License
 
 MIT

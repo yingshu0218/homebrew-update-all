@@ -27,6 +27,13 @@ brew ua auto
 3. **逐个升级** – 每个包独立下载→安装，失败继续下一个
 4. **brew cleanup** – 清理旧版本
 
+## 卸载
+
+```bash
+brew uninstall brew-update-all
+brew untap yingshu0218/update-all
+```
+
 ## 许可证
 
 MIT
