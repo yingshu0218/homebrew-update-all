@@ -18,7 +18,18 @@ brew ua
 
 # 自动模式 – 不提示，全部更新
 brew ua auto
+
+# 包含自动更新应用 – 默认跳过 Chrome/VS Code 等自带更新的 cask
+brew ua -a
+brew ua auto -a
 ```
+
+| 选项 | 说明 |
+|------|------|
+| `auto` | 自动模式，跳过交互直接升级全部 |
+| `-a` | 扫描所有 cask，包含自带自动更新的应用（Chrome、VS Code、Edge 等） |
+
+> **提示**：不加 `-a` 时，Homebrew 默认跳过 `auto_updates true` 的应用，因为它们会自己后台更新。如果你希望精确控制所有包的版本，加上 `-a`。
 
 ## 脚本流程
 

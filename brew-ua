@@ -6,7 +6,7 @@ use_greedy=0
 
 for arg in "$@"; do
     case "$arg" in
-        --greedy)
+        -a)
             use_greedy=1
             ;;
         auto)
@@ -41,7 +41,7 @@ fi
 # === 显示可更新列表 ===
 echo ""
 echo "=== 检测到以下可更新包 ==="
-[[ $use_greedy -eq 1 ]] && echo "(已启用 --greedy，包含自动更新的应用)"
+[[ $use_greedy -eq 1 ]] && echo "(已启用 -a，包含自动更新的应用如 Chrome / VS Code 等)"
 echo ""
 local idx=0
 for f in $formulae; do
