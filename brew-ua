@@ -1,0 +1,83 @@
+#!/bin/zsh
+
+brew update
+
+formulae=($(brew outdated --formula --quiet))
+casks=($(brew outdated --cask --quiet))
+
+num_f=${#formulae[@]}
+num_c=${#casks[@]}
+total=$((num_f + num_c))
+
+if [[ $total -eq 0 ]]; then
+    echo ""
+    echo "✅ 所有包已是最新"
+    exit 0
+fi
+
+echo ""
+echo "=== 检测到以下可更新包 ==="
+local idx=0
+for f in $formulae; do
+    ((idx++))
+    printf "  [%3d] formula: %s\n" "$idx" "$f"
+done
+if [[ $num_c -gt 0 ]]; then
+    echo "  ---"
+    for c in $casks; do
+        ((idx++))
+        printf "  [%3d] cask:    %s\n" "$idx" "$c"
+    done
+fi
+
+echo ""
+
+# determine selection
+selected=()
+
+if [[ "$1" == "auto" ]]; then
+    selected=($(seq 1 $total))
+else
+    echo -n "输入序号更新（回车=全部，支持 1 3 5 或 2-7 等）: "
+    read input
+    if [[ -z "$input" ]]; then
+        selected=($(seq 1 $total))
+    else
+        for token in ${(z)input}; do
+            if [[ "$token" =~ ^[0-9]+-[0-9]+$ ]]; then
+                for i in $(seq ${token%-*} ${token#*-}); do
+                    selected+=($i)
+                done
+            elif [[ "$token" =~ ^[0-9]+$ ]]; then
+                selected+=($token)
+            fi
+        done
+    fi
+fi
+
+selected=(${(u)selected})
+
+echo ""
+echo "=== 开始升级 ==="
+for i in $selected; do
+    if [[ $i -le $num_f ]]; then
+        name=$formulae[$i]
+        type="formula"
+    else
+        name=$casks[$((i - num_f))]
+        type="cask"
+    fi
+    echo "→ 正在升级 $type: $name"
+    if brew upgrade "$name"; then
+        echo "✓ $name 升级完成"
+    else
+        echo "✗ $name 升级失败，继续"
+    fi
+done
+
+echo ""
+echo "=== 清理旧版本 ==="
+brew cleanup
+
+echo ""
+echo "✅ 全部完成"
