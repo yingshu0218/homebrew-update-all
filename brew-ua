@@ -1,110 +1,411 @@
 #!/bin/zsh
 
-# === 参数解析 ===
-mode="interactive"  # interactive | auto
+# ============================================================
+#  brew-update-all  —  逐个升级 Homebrew formula 和 cask
+# ============================================================
+
+# ---------- 颜色主题 ----------
+autoload -U colors && colors
+
+C_RESET=$'\033[0m'
+C_BOLD=$'\033[1m'
+C_DIM=$'\033[2m'
+C_ITALIC=$'\033[3m'
+C_UNDERLINE=$'\033[4m'
+
+C_PRIMARY=$'\033[38;5;75m'
+C_SUCCESS=$'\033[38;5;78m'
+C_ERROR=$'\033[38;5;203m'
+C_WARN=$'\033[38;5;222m'
+C_INFO=$'\033[38;5;146m'
+C_FORMULA=$'\033[38;5;110m'
+C_CASK=$'\033[38;5;180m'
+C_BORDER=$'\033[38;5;240m'
+C_PROGRESS_BG=$'\033[38;5;237m'
+C_PROGRESS_FG=$'\033[38;5;75m'
+C_MUTED=$'\033[38;5;245m'
+C_ACCENT=$'\033[38;5;213m'
+
+# ---------- 边框字符 ----------
+B_H="─" B_V="│" B_TL="┌" B_TR="┐" B_BL="└" B_BR="┘"
+B_L="├" B_R="┤" B_T="┬" B_B="┴" B_C="┼"
+
+# ---------- 工具函数 ----------
+
+function _print_help() {
+  cat <<EOF
+${C_BOLD}brew ua${C_RESET} — 逐个升级 Homebrew formula 和 cask
+
+${C_BOLD}用法:${C_RESET}
+  brew ua [模式] [选项]
+
+${C_BOLD}模式:${C_RESET}
+  ${C_PRIMARY}（空）${C_RESET}      交互模式，输入序号选择要升级的包
+  ${C_PRIMARY}auto${C_RESET}        自动模式，全部升级
+  ${C_PRIMARY}formula${C_RESET}     只升级 formula（交互模式）
+  ${C_PRIMARY}cask${C_RESET}        只升级 cask（交互模式）
+
+${C_BOLD}选项:${C_RESET}
+  ${C_PRIMARY}-a${C_RESET}           包含自带自动更新的 cask（--greedy）
+
+${C_BOLD}示例:${C_RESET}
+  brew ua               交互选择
+  brew ua auto          自动全部升级
+  brew ua formula       只升级 formula
+  brew ua cask -a       只升级 cask（含自动更新的应用）
+  brew ua auto -a       自动全部升级（含自动更新的应用）
+EOF
+}
+
+function _repeat_char() {
+  local char="$1" count="$2"
+  printf "%${count}s" "" | tr " " "$char"
+}
+
+function _fmt_duration() {
+  local total=$1
+  if (( total < 60 )); then
+    printf "%ds" "$total"
+  elif (( total < 3600 )); then
+    printf "%dm%ds" $(( total / 60 )) $(( total % 60 ))
+  else
+    printf "%dh%dm%ds" $(( total / 3600 )) $(( (total % 3600) / 60 )) $(( total % 60 ))
+  fi
+}
+
+function _get_terminal_width() {
+  local w=${COLUMNS:-80}
+  echo "$w"
+}
+
+function _draw_top_border() {
+  local title="$1" width
+  width=$(_get_terminal_width)
+  (( width = width < 60 ? 60 : width ))
+  local title_len=$(( ${#title} + 2 ))
+  local pad_left=$(( (width - title_len - 2) / 2 ))
+  local pad_right=$(( width - title_len - 2 - pad_left ))
+
+  echo -n "${C_BORDER}${B_TL}$(_repeat_char "$B_H" "$pad_left")"
+  echo -n "${C_RESET} ${C_BOLD}${C_PRIMARY}${title}${C_RESET} ${C_BORDER}"
+  echo -n "$(_repeat_char "$B_H" "$pad_right")${B_TR}${C_RESET}"
+  echo ""
+}
+
+function _draw_bottom_border() {
+  local width
+  width=$(_get_terminal_width)
+  (( width = width < 60 ? 60 : width ))
+  echo "${C_BORDER}${B_BL}$(_repeat_char "$B_H" $(( width - 2 )))${B_BR}${C_RESET}"
+}
+
+function _draw_mid_border() {
+  local width
+  width=$(_get_terminal_width)
+  (( width = width < 60 ? 60 : width ))
+  echo "${C_BORDER}${B_L}$(_repeat_char "$B_H" $(( width - 2 )))${B_R}${C_RESET}"
+}
+
+function _line_left() {
+  local content="$1"
+  local width
+  width=$(_get_terminal_width)
+  (( width = width < 60 ? 60 : width ))
+  local visible=${#content}
+  local pad=$(( width - 2 - visible ))
+  (( pad < 1 )) && pad=1
+  echo "${C_BORDER}${B_V}${C_RESET} ${content}${C_BORDER}$(printf "%${pad}s" " ")${B_V}${C_RESET}"
+}
+
+function _line_centered() {
+  local content="$1"
+  local width
+  width=$(_get_terminal_width)
+  (( width = width < 60 ? 60 : width ))
+  local visible=${#content}
+  local total_pad=$(( width - 2 - visible ))
+  (( total_pad < 2 )) && total_pad=2
+  local left=$(( total_pad / 2 ))
+  local right=$(( total_pad - left ))
+  echo "${C_BORDER}${B_V}${C_RESET}$(printf "%${left}s" " ")${content}$(printf "%${right}s" " ")${C_BORDER}${B_V}${C_RESET}"
+}
+
+function _progress_bar() {
+  local current=$1 total=$2 label="$3"
+  local width
+  width=$(_get_terminal_width)
+  (( width = width < 60 ? 60 : width ))
+
+  local bar_width=$(( width - 20 ))
+  (( bar_width < 10 )) && bar_width=10
+
+  local percent=$(( current * 100 / total ))
+  local filled=$(( current * bar_width / total ))
+  local empty=$(( bar_width - filled ))
+
+  local bar="${C_PROGRESS_FG}$(_repeat_char "█" "$filled")${C_PROGRESS_BG}$(_repeat_char "░" "$empty")${C_RESET}"
+
+  printf "\r${C_BORDER}${B_V}${C_RESET} ${bar} ${C_BOLD}${C_PRIMARY}%3d%%${C_RESET} ${C_MUTED}(%d/%d)${C_RESET} ${C_BORDER}${B_V}${C_RESET}" "$percent" "$current" "$total"
+}
+
+function _section_title() {
+  local icon="$1" title="$2"
+  echo ""
+  echo "${C_BOLD}${C_PRIMARY}${icon} ${title}${C_RESET}"
+  echo "${C_DIM}$(_repeat_char "─" $(( ${#title} + 4 )))${C_RESET}"
+}
+
+# ---------- 参数解析 ----------
+mode="interactive"
+filter="all"
 use_greedy=0
 
 for arg in "$@"; do
-    case "$arg" in
-        -a)
-            use_greedy=1
-            ;;
-        auto)
-            mode="auto"
-            ;;
-    esac
+  case "$arg" in
+    -a) use_greedy=1 ;;
+    auto) mode="auto" ;;
+    formula) filter="formula" ;;
+    cask) filter="cask" ;;
+    -h|--help)
+      _print_help
+      exit 0
+      ;;
+  esac
 done
 
-# === brew update ===
-echo ""
-echo "=== 更新 Homebrew 源 ==="
-brew update
+# ---------- 主流程 ----------
 
-# === 构建 outdated 命令参数 ===
+total_start=$(date +%s)
+
+# ---- brew update ----
+_section_title "🔄" "更新 Homebrew 源"
+brew update
+echo "${C_SUCCESS}  ✓ 源更新完成${C_RESET}"
+
+# ---- 获取过期包列表 ----
 cask_extra_args=()
 [[ $use_greedy -eq 1 ]] && cask_extra_args=(--greedy)
 
-# === 获取过期包列表 ===
-formulae=($(brew outdated --formula --quiet))
-casks=($(brew outdated --cask $cask_extra_args --quiet))
+formulae=()
+casks=()
+
+if [[ "$filter" != "cask" ]]; then
+  formulae=($(brew outdated --formula --quiet))
+fi
+if [[ "$filter" != "formula" ]]; then
+  casks=($(brew outdated --cask $cask_extra_args --quiet))
+fi
 
 num_f=${#formulae[@]}
 num_c=${#casks[@]}
 total=$((num_f + num_c))
 
-if [[ $total -eq 0 ]]; then
-    echo ""
-    echo "✅ 所有包已是最新"
-    exit 0
-fi
+# ---- 显示可更新列表 ----
+echo ""
+_draw_top_border "📦 可更新的包"
 
-# === 显示可更新列表 ===
-echo ""
-echo "=== 检测到以下可更新包 ==="
-[[ $use_greedy -eq 1 ]] && echo "(已启用 -a，包含自动更新的应用如 Chrome / VS Code 等)"
-echo ""
-local idx=0
-for f in $formulae; do
+if (( num_f > 0 )); then
+  _line_left "${C_BOLD}${C_FORMULA}🍺 Formulae${C_RESET}  ${C_MUTED}(${num_f} 个)${C_RESET}"
+  _draw_mid_border
+  local idx=0
+  for f in $formulae; do
     ((idx++))
-    printf "  [%3d] formula: %s\n" "$idx" "$f"
-done
-if [[ $num_c -gt 0 ]]; then
-    echo "  ---"
-    for c in $casks; do
-        ((idx++))
-        printf "  [%3d] cask:    %s\n" "$idx" "$c"
-    done
+    local num_str
+    num_str=$(printf "%3d" "$idx")
+    _line_left "  ${C_MUTED}[${C_RESET}${C_PRIMARY}${C_BOLD}${num_str}${C_RESET}${C_MUTED}]${C_RESET}  ${C_FORMULA}${f}${C_RESET}"
+  done
 fi
 
-echo ""
+if (( num_f > 0 && num_c > 0 )); then
+  _draw_mid_border
+fi
 
-# === 用户选择 ===
+if (( num_c > 0 )); then
+  _line_left "${C_BOLD}${C_CASK}📱 Casks${C_RESET}  ${C_MUTED}(${num_c} 个)${C_RESET}"
+  _draw_mid_border
+  local idx=$num_f
+  for c in $casks; do
+    ((idx++))
+    local num_str
+    num_str=$(printf "%3d" "$idx")
+    _line_left "  ${C_MUTED}[${C_RESET}${C_PRIMARY}${C_BOLD}${num_str}${C_RESET}${C_MUTED}]${C_RESET}  ${C_CASK}${c}${C_RESET}"
+  done
+fi
+
+if (( total == 0 )); then
+  _line_centered "${C_SUCCESS}${C_BOLD}🎉 所有包已是最新！${C_RESET}"
+  _draw_bottom_border
+  echo ""
+  exit 0
+fi
+
+_draw_bottom_border
+
+if [[ $use_greedy -eq 1 ]]; then
+  echo "${C_MUTED}  💡 已启用 -a，包含自带自动更新的应用（Chrome / VS Code 等）${C_RESET}"
+fi
+
+# ---- 用户选择 ----
 selected=()
 
 if [[ "$mode" == "auto" ]]; then
-    selected=($(seq 1 $total))
+  selected=($(seq 1 $total))
 else
-    echo -n "输入序号更新（回车=全部，支持 1 3 5 或 2-7 等）: "
-    read input
-    if [[ -z "$input" ]]; then
-        selected=($(seq 1 $total))
-    else
-        for token in ${(z)input}; do
-            if [[ "$token" =~ ^[0-9]+-[0-9]+$ ]]; then
-                for i in $(seq ${token%-*} ${token#*-}); do
-                    selected+=($i)
-                done
-            elif [[ "$token" =~ ^[0-9]+$ ]]; then
-                selected+=($token)
-            fi
+  echo ""
+  echo "${C_BOLD}${C_PRIMARY}🎯 选择要升级的包${C_RESET}"
+  echo "${C_MUTED}  回车=全部，支持空格分隔（1 3 5）或范围（2-7）${C_RESET}"
+  echo -n "  ${C_BOLD}输入序号:${C_RESET} "
+  read input
+
+  if [[ -z "$input" ]]; then
+    selected=($(seq 1 $total))
+  else
+    for token in ${(z)input}; do
+      if [[ "$token" =~ ^[0-9]+-[0-9]+$ ]]; then
+        for i in $(seq ${token%-*} ${token#*-}); do
+          (( i >= 1 && i <= total )) && selected+=($i)
         done
+      elif [[ "$token" =~ ^[0-9]+$ ]]; then
+        (( token >= 1 && token <= total )) && selected+=($token)
+      fi
+    done
+    if (( ${#selected[@]} == 0 )); then
+      echo ""
+      echo "${C_ERROR}  ✗ 没有选中有效的序号，已取消${C_RESET}"
+      exit 1
     fi
+  fi
 fi
 
 selected=(${(u)selected})
+num_selected=${#selected[@]}
 
-# === 逐个升级 ===
 echo ""
-echo "=== 开始升级 ==="
+echo "${C_INFO}  ℹ 已选择 ${C_BOLD}${num_selected}${C_RESET}${C_INFO} 个包进行升级${C_RESET}"
+
+# ---- 逐个升级 ----
+echo ""
+_draw_top_border "🚀 升级进度"
+echo -n ""
+
+success_count=0
+fail_count=0
+failed_names=()
+success_names=()
+pkg_times=()
+current_idx=0
+
+_progress_bar 0 "$num_selected"
+echo ""
+
 for i in $selected; do
-    if [[ $i -le $num_f ]]; then
-        name=$formulae[$i]
-        type="formula"
-    else
-        name=$casks[$((i - num_f))]
-        type="cask"
-    fi
-    echo "→ 正在升级 $type: $name"
-    if brew upgrade "$name"; then
-        echo "✓ $name 升级完成"
-    else
-        echo "✗ $name 升级失败，继续"
-    fi
+  ((current_idx++))
+
+  if [[ $i -le $num_f ]]; then
+    name=$formulae[$i]
+    type="formula"
+    type_color="$C_FORMULA"
+    type_icon="🍺"
+  else
+    name=$casks[$((i - num_f))]
+    type="cask"
+    type_color="$C_CASK"
+    type_icon="📱"
+  fi
+
+  echo -ne "\r\033[K"
+  echo "${C_BORDER}${B_V}${C_RESET} ${C_BOLD}[${current_idx}/${num_selected}]${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${C_RESET} ${C_INFO}升级中...${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
+
+  pkg_start=$(date +%s)
+
+  if brew upgrade "$name" > /tmp/brew-ua-$name.log 2>&1; then
+    pkg_end=$(date +%s)
+    pkg_dur=$(( pkg_end - pkg_start ))
+    pkg_times+=("$pkg_dur")
+    success_count=$(( success_count + 1 ))
+    success_names+=("$name")
+
+    echo -ne "\r\033[K"
+    echo "${C_BORDER}${B_V}${C_RESET} ${C_SUCCESS}✓${C_RESET} ${type_color}${name}${C_RESET} ${C_MUTED}升级完成 · $(_fmt_duration $pkg_dur)${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
+  else
+    pkg_end=$(date +%s)
+    pkg_dur=$(( pkg_end - pkg_start ))
+    pkg_times+=("$pkg_dur")
+    fail_count=$(( fail_count + 1 ))
+    failed_names+=("$name")
+
+    echo -ne "\r\033[K"
+    echo "${C_BORDER}${B_V}${C_RESET} ${C_ERROR}✗${C_RESET} ${type_color}${name}${C_RESET} ${C_ERROR}升级失败${C_RESET} ${C_MUTED}· $(_fmt_duration $pkg_dur)${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
+    echo "${C_MUTED}    日志: /tmp/brew-ua-$name.log${C_RESET}"
+  fi
+
+  _progress_bar "$current_idx" "$num_selected"
+  echo ""
 done
 
+_draw_bottom_border
+
+# ---- cleanup ----
 echo ""
-echo "=== 清理旧版本 ==="
+_section_title "🧹" "清理旧版本"
 brew cleanup
+echo "${C_SUCCESS}  ✓ 清理完成${C_RESET}"
+
+# ---- 统计摘要 ----
+total_end=$(date +%s)
+total_dur=$(( total_end - total_start ))
 
 echo ""
-echo "✅ 全部完成"
+_draw_top_border "📊 升级统计"
+
+_line_left "  ${C_BOLD}🕐 总耗时:${C_RESET}  ${C_PRIMARY}$(_fmt_duration $total_dur)${C_RESET}"
+_draw_mid_border
+_line_left "  ${C_BOLD}📦 总数量:${C_RESET}  ${num_selected} 个包"
+_line_left "     ${C_SUCCESS}✓ 成功:${C_RESET}  ${success_count} 个"
+_line_left "     ${C_ERROR}✗ 失败:${C_RESET}  ${fail_count} 个"
+_line_left "     ${C_MUTED}成功率:${C_RESET}  $(( num_selected > 0 ? success_count * 100 / num_selected : 0 ))%"
+
+if (( fail_count > 0 )); then
+  _draw_mid_border
+  _line_left "  ${C_ERROR}${C_BOLD}失败的包:${C_RESET}"
+  local fn
+  for fn in $failed_names; do
+    _line_left "     ${C_ERROR}• ${fn}${C_RESET}"
+  done
+fi
+
+if (( success_count > 0 )); then
+  _draw_mid_border
+  _line_left "  ${C_SUCCESS}${C_BOLD}成功的包:${C_RESET}"
+  local count=0
+  local line=""
+  for sn in $success_names; do
+    if (( count == 0 )); then
+      line="     ${C_SUCCESS}• ${sn}${C_RESET}"
+      count=1
+    else
+      line="${line}${C_MUTED}, ${C_RESET}${C_SUCCESS}${sn}${C_RESET}"
+      count=$(( count + 1 ))
+    fi
+    if (( count >= 5 )); then
+      _line_left "$line"
+      count=0
+      line=""
+    fi
+  done
+  if (( count > 0 )); then
+    _line_left "$line"
+  fi
+fi
+
+_draw_bottom_border
+echo ""
+
+if (( fail_count > 0 )); then
+  echo "${C_WARN}  ⚠  有 ${fail_count} 个包升级失败，可查看上方日志排查问题${C_RESET}"
+  echo ""
+  exit 1
+fi
+
+echo "${C_SUCCESS}${C_BOLD}  ✅ 全部完成！${C_RESET}"
+echo ""
