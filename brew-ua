@@ -30,6 +30,9 @@ C_ACCENT=$'\033[38;5;213m'
 B_H="─" B_V="│" B_TL="┌" B_TR="┐" B_BL="└" B_BR="┘"
 B_L="├" B_R="┤" B_T="┬" B_B="┴" B_C="┼"
 
+# ---------- spinner 动画帧 ----------
+SPIN_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+
 # ---------- 工具函数 ----------
 
 function _print_help() {
@@ -153,6 +156,55 @@ function _section_title() {
   echo ""
   echo "${C_BOLD}${C_PRIMARY}${icon} ${title}${C_RESET}"
   echo "${C_DIM}$(_repeat_char "─" $(( ${#title} + 4 )))${C_RESET}"
+}
+
+function _hide_cursor() {
+  printf "\033[?25l"
+}
+
+function _show_cursor() {
+  printf "\033[?25h"
+}
+
+function _cursor_up() {
+  local n=${1:-1}
+  printf "\033[%dA" "$n"
+}
+
+function _cursor_down() {
+  local n=${1:-1}
+  printf "\033[%dB" "$n"
+}
+
+function _clear_line() {
+  printf "\r\033[K"
+}
+
+function _progress_bar_with_spinner() {
+  local current=$1 total=$2 spin_idx=$3 pkg_name=$4 pkg_type=$5 pkg_icon=$6 type_color=$7
+  local width
+  width=$(_get_terminal_width)
+  (( width = width < 60 ? 60 : width ))
+
+  local bar_width=$(( width - 20 ))
+  (( bar_width < 10 )) && bar_width=10
+
+  local percent=$(( current * 100 / total ))
+  local filled=$(( current * bar_width / total ))
+  local empty=$(( bar_width - filled ))
+
+  local bar="${C_PROGRESS_FG}$(_repeat_char "█" "$filled")${C_PROGRESS_BG}$(_repeat_char "░" "$empty")${C_RESET}"
+
+  echo "${C_BORDER}${B_V}${C_RESET} ${bar} ${C_BOLD}${C_PRIMARY}$(printf "%3d" "$percent")%%${C_RESET} ${C_MUTED}(%d/%d)${C_RESET} ${C_BORDER}${B_V}${C_RESET}" "$current" "$total"
+
+  local spin_count=${#SPIN_FRAMES[@]}
+  local spin_pos=$(( spin_idx % spin_count ))
+  local spin_char="$SPIN_FRAMES[$spin_pos]"
+  local status_line="     ${C_PRIMARY}${spin_char}${C_RESET} ${pkg_icon} ${type_color}${pkg_name}${C_RESET} ${C_MUTED}(${pkg_type})${C_RESET} ${C_INFO}升级中...${C_RESET}"
+  local visible=$(( ${#pkg_name} + 30 ))
+  local pad=$(( width - 2 - visible ))
+  (( pad < 1 )) && pad=1
+  echo "${C_BORDER}${B_V}${C_RESET}${status_line}${C_BORDER}$(printf "%${pad}s" " ")${B_V}${C_RESET}"
 }
 
 # ---------- 参数解析 ----------
@@ -295,6 +347,9 @@ success_names=()
 pkg_times=()
 current_idx=0
 
+_hide_cursor
+trap '_show_cursor' EXIT INT TERM
+
 _progress_bar 0 "$num_selected"
 echo ""
 
@@ -313,35 +368,54 @@ for i in $selected; do
     type_icon="📱"
   fi
 
-  echo -ne "\r\033[K"
-  echo "${C_BORDER}${B_V}${C_RESET} ${C_BOLD}[${current_idx}/${num_selected}]${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${C_RESET} ${C_INFO}升级中...${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
+  _cursor_up 1
+  echo "${C_BORDER}${B_V}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${C_RESET} ${C_INFO}升级中...${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
+  _progress_bar "$(( current_idx - 1 ))" "$num_selected"
+  echo ""
 
   pkg_start=$(date +%s)
+  brew upgrade "$name" > /tmp/brew-ua-$name.log 2>&1 &
+  brew_pid=$!
 
-  if brew upgrade "$name" > /tmp/brew-ua-$name.log 2>&1; then
-    pkg_end=$(date +%s)
-    pkg_dur=$(( pkg_end - pkg_start ))
-    pkg_times+=("$pkg_dur")
+  spin_idx=0
+  while kill -0 "$brew_pid" 2>/dev/null; do
+    _cursor_up 2
+    local spin_count=${#SPIN_FRAMES[@]}
+    local spin_pos=$(( spin_idx % spin_count ))
+    local spin_char="$SPIN_FRAMES[$spin_pos]"
+    echo "${C_BORDER}${B_V}${C_RESET} ${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${C_RESET} ${C_INFO}升级中...${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
+    _progress_bar "$(( current_idx - 1 ))" "$num_selected"
+    echo ""
+    spin_idx=$(( spin_idx + 1 ))
+    sleep 0.1
+  done
+
+  wait "$brew_pid"
+  brew_exit=$?
+
+  pkg_end=$(date +%s)
+  pkg_dur=$(( pkg_end - pkg_start ))
+  pkg_times+=("$pkg_dur")
+
+  _cursor_up 2
+
+  if (( brew_exit == 0 )); then
     success_count=$(( success_count + 1 ))
     success_names+=("$name")
-
-    echo -ne "\r\033[K"
     echo "${C_BORDER}${B_V}${C_RESET} ${C_SUCCESS}✓${C_RESET} ${type_color}${name}${C_RESET} ${C_MUTED}升级完成 · $(_fmt_duration $pkg_dur)${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
   else
-    pkg_end=$(date +%s)
-    pkg_dur=$(( pkg_end - pkg_start ))
-    pkg_times+=("$pkg_dur")
     fail_count=$(( fail_count + 1 ))
     failed_names+=("$name")
-
-    echo -ne "\r\033[K"
     echo "${C_BORDER}${B_V}${C_RESET} ${C_ERROR}✗${C_RESET} ${type_color}${name}${C_RESET} ${C_ERROR}升级失败${C_RESET} ${C_MUTED}· $(_fmt_duration $pkg_dur)${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
-    echo "${C_MUTED}    日志: /tmp/brew-ua-$name.log${C_RESET}"
   fi
 
   _progress_bar "$current_idx" "$num_selected"
   echo ""
 done
+
+_cursor_up 1
+_show_cursor
+trap - EXIT INT TERM
 
 _draw_bottom_border
 
@@ -370,7 +444,7 @@ if (( fail_count > 0 )); then
   _line_left "  ${C_ERROR}${C_BOLD}失败的包:${C_RESET}"
   local fn
   for fn in $failed_names; do
-    _line_left "     ${C_ERROR}• ${fn}${C_RESET}"
+    _line_left "     ${C_ERROR}• ${fn}${C_RESET}  ${C_MUTED}日志: /tmp/brew-ua-${fn}.log${C_RESET}"
   done
 fi
 
