@@ -50,6 +50,8 @@ ${C_BOLD}模式:${C_RESET}
 
 ${C_BOLD}选项:${C_RESET}
   ${C_PRIMARY}-a${C_RESET}           包含自带自动更新的 cask（--greedy）
+  ${C_PRIMARY}--prune${C_RESET}       升级后深度清理下载缓存
+  ${C_PRIMARY}--clean-logs${C_RESET}  升级后清理本次产生的临时日志
 
 ${C_BOLD}示例:${C_RESET}
   brew ua               交互选择
@@ -73,6 +75,32 @@ function _fmt_duration() {
     printf "%dm%ds" $(( total / 60 )) $(( total % 60 ))
   else
     printf "%dh%dm%ds" $(( total / 3600 )) $(( (total % 3600) / 60 )) $(( total % 60 ))
+  fi
+}
+
+function _fmt_size() {
+  local bytes=$1
+  if (( bytes < 1024 )); then
+    printf "%dB" "$bytes"
+  elif (( bytes < 1048576 )); then
+    printf "%.1fKB" $(( bytes / 1024.0 ))
+  elif (( bytes < 1073741824 )); then
+    printf "%.1fMB" $(( bytes / 1048576.0 ))
+  else
+    printf "%.1fGB" $(( bytes / 1073741824.0 ))
+  fi
+}
+
+function _fmt_speed() {
+  local bytes_per_sec=$1
+  if (( bytes_per_sec < 1024 )); then
+    printf "%dB/s" "$bytes_per_sec"
+  elif (( bytes_per_sec < 1048576 )); then
+    printf "%.1fKB/s" $(( bytes_per_sec / 1024.0 ))
+  elif (( bytes_per_sec < 1073741824 )); then
+    printf "%.1fMB/s" $(( bytes_per_sec / 1048576.0 ))
+  else
+    printf "%.1fGB/s" $(( bytes_per_sec / 1073741824.0 ))
   fi
 }
 
@@ -211,6 +239,8 @@ function _progress_bar_with_spinner() {
 mode="interactive"
 filter="all"
 use_greedy=0
+clean_logs=0
+deep_prune=0
 
 for arg in "$@"; do
   case "$arg" in
@@ -218,6 +248,8 @@ for arg in "$@"; do
     auto) mode="auto" ;;
     formula) filter="formula" ;;
     cask) filter="cask" ;;
+    --clean-logs) clean_logs=1 ;;
+    --prune) deep_prune=1 ;;
     -h|--help)
       _print_help
       exit 0
@@ -368,22 +400,55 @@ for i in $selected; do
     type_icon="📱"
   fi
 
+  local pkg_size=0
+  if [[ "$type" == "formula" ]]; then
+    pkg_size=$(brew info --json=v2 "$name" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['formulae'][0].get('installed_size',0) or d['formulae'][0].get('size',0) or 0)" 2>/dev/null || echo 0)
+  else
+    pkg_size=$(brew info --cask --json=v2 "$name" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['casks'][0].get('size',0) or 0)" 2>/dev/null || echo 0)
+  fi
+  [[ -z "$pkg_size" ]] && pkg_size=0
+  local size_display=""
+  (( pkg_size > 0 )) && size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
+
   _cursor_up 1
-  echo "${C_BORDER}${B_V}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${C_RESET} ${C_INFO}升级中...${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
+  echo "${C_BORDER}${B_V}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}准备中...${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
   _progress_bar "$(( current_idx - 1 ))" "$num_selected"
   echo ""
 
   pkg_start=$(date +%s)
-  brew upgrade "$name" > /tmp/brew-ua-$name.log 2>&1 &
+  local log_file="/tmp/brew-ua-$name.log"
+  brew upgrade "$name" > "$log_file" 2>&1 &
   brew_pid=$!
 
   spin_idx=0
+  local last_size=0
+  local last_time=$pkg_start
+  local speed=0
   while kill -0 "$brew_pid" 2>/dev/null; do
     _cursor_up 2
+
+    local current_size=0
+    [[ -f "$log_file" ]] && current_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
+    [[ -z "$current_size" ]] && current_size=0
+    local now=$(date +%s)
+    local dt=$(( now - last_time ))
+    if (( dt >= 1 && current_size >= last_size )); then
+      speed=$(( (current_size - last_size) / dt ))
+      last_size=$current_size
+      last_time=$now
+    fi
+
+    local speed_display=""
+    if (( speed > 0 )); then
+      speed_display=" ${C_MUTED}· $(_fmt_speed $speed)${C_RESET}"
+    fi
+
     local spin_count=${#SPIN_FRAMES[@]}
     local spin_pos=$(( spin_idx % spin_count ))
     local spin_char="$SPIN_FRAMES[$spin_pos]"
-    echo "${C_BORDER}${B_V}${C_RESET} ${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${C_RESET} ${C_INFO}升级中...${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
+
+    local status_text="升级中..."
+    echo "${C_BORDER}${B_V}${C_RESET} ${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display}${speed_display} ${C_INFO}${status_text}${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
     _progress_bar "$(( current_idx - 1 ))" "$num_selected"
     echo ""
     spin_idx=$(( spin_idx + 1 ))
@@ -424,6 +489,24 @@ echo ""
 _section_title "🧹" "清理旧版本"
 brew cleanup
 echo "${C_SUCCESS}  ✓ 清理完成${C_RESET}"
+
+if (( deep_prune == 1 )); then
+  echo ""
+  echo "${C_INFO}  ℹ 正在深度清理下载缓存...${C_RESET}"
+  brew cleanup --prune=all
+  echo "${C_SUCCESS}  ✓ 深度清理完成${C_RESET}"
+fi
+
+if (( clean_logs == 1 )); then
+  echo ""
+  echo "${C_INFO}  ℹ 清理本次产生的临时日志...${C_RESET}"
+  local cleaned=0
+  local all_names=("${success_names[@]}" "${failed_names[@]}")
+  for n in $all_names; do
+    [[ -f "/tmp/brew-ua-$n.log" ]] && rm -f "/tmp/brew-ua-$n.log" && cleaned=$(( cleaned + 1 ))
+  done
+  echo "${C_SUCCESS}  ✓ 已清理 ${cleaned} 个日志文件${C_RESET}"
+fi
 
 # ---- 统计摘要 ----
 total_end=$(date +%s)
