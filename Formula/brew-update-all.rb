@@ -1,8 +1,8 @@
 class BrewUpdateAll < Formula
-  desc "逐个升级 Homebrew formulae 和 cask，支持分类升级 / 彩色界面 / 进度条 / 耗时统计"
+  desc "逐个升级 Homebrew formulae 和 cask，支持包大小显示 / 下载速度 / 深度清理"
   homepage "https://github.com/yingshu0218/homebrew-update-all"
-  url "https://github.com/yingshu0218/homebrew-update-all/archive/refs/tags/v1.3.0.tar.gz"
-  sha256 "755e2b92408c77364709ca0fa6c78dabda26809333bc59a90c14d673877055ac"
+  url "https://github.com/yingshu0218/homebrew-update-all/archive/refs/tags/v1.4.0.tar.gz"
+  sha256 "8289120db3493a74eb80a491a9722fa67c67045ac3e9b9a99b692684914f1b42"
 
   def install
     bin.install "brew-ua"
