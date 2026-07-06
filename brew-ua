@@ -263,8 +263,65 @@ total_start=$(date +%s)
 
 # ---- brew update ----
 _section_title "🔄" "更新 Homebrew 源"
-brew update
-echo "${C_SUCCESS}  ✓ 源更新完成${C_RESET}"
+
+update_log="/tmp/brew-ua-update.log"
+brew update > "$update_log" 2>&1 &
+update_pid=$!
+
+_hide_cursor
+trap '_show_cursor' EXIT INT TERM
+
+update_start=$(date +%s)
+spin_idx=0
+echo "${C_MUTED}  准备中...${C_RESET}"
+
+while kill -0 "$update_pid" 2>/dev/null; do
+  now=$(date +%s)
+  elapsed=$(( now - update_start ))
+
+  local spin_count=${#SPIN_FRAMES[@]}
+  local spin_pos=$(( spin_idx % spin_count ))
+  local spin_char="$SPIN_FRAMES[$spin_pos]"
+
+  # 从日志提取当前正在更新的源（如 "homebrew/core" 或 tap 名）
+  local current_tap=""
+  [[ -f "$update_log" ]] && current_tap=$(grep -oE '(homebrew/[a-z/]+|[a-z0-9_-]+/[a-z0-9_-]+)' "$update_log" 2>/dev/null | tail -1)
+
+  _cursor_up 1
+  if [[ -n "$current_tap" ]]; then
+    echo "${C_PRIMARY}${spin_char}${C_RESET} ${C_INFO}正在更新源${C_RESET} ${C_MUTED}${current_tap}${C_RESET} ${C_MUTED}· ${elapsed}s${C_RESET}        "
+  else
+    echo "${C_PRIMARY}${spin_char}${C_RESET} ${C_INFO}正在更新源...${C_RESET} ${C_MUTED}· ${elapsed}s${C_RESET}        "
+  fi
+
+  spin_idx=$(( spin_idx + 1 ))
+  sleep 0.1
+done
+
+wait "$update_pid"
+update_exit=$?
+
+update_end=$(date +%s)
+update_dur=$(( update_end - update_start ))
+
+_cursor_up 1
+if (( update_exit == 0 )); then
+  # 从日志提取所有更新过的源
+  local updated_taps=$(grep -oE '(homebrew/[a-z/]+|[a-z0-9_-]+/[a-z0-9_-]+)' "$update_log" 2>/dev/null | sort -u | tr '\n' ' ')
+  if [[ -n "$updated_taps" ]]; then
+    echo "${C_SUCCESS}  ✓${C_RESET} ${C_MUTED}源更新完成 · ${update_dur}s${C_RESET}"
+    echo "${C_MUTED}  已更新: ${updated_taps}${C_RESET}"
+  else
+    echo "${C_SUCCESS}  ✓${C_RESET} ${C_MUTED}源更新完成 · ${update_dur}s${C_RESET}"
+  fi
+else
+  echo "${C_ERROR}  ✗ 源更新失败 · ${update_dur}s${C_RESET}"
+  echo "${C_MUTED}  日志: ${update_log}${C_RESET}"
+fi
+
+_show_cursor
+trap - EXIT INT TERM
+(( update_exit == 0 )) && rm -f "$update_log"
 
 # ---- 获取过期包列表 ----
 cask_extra_args=()
