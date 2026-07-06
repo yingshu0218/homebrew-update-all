@@ -265,6 +265,8 @@ total_start=$(date +%s)
 _section_title "🔄" "更新 Homebrew 源"
 
 update_log="/tmp/brew-ua-update.log"
+# 获取已安装的 tap 列表，用于精准匹配
+installed_taps=($(brew tap 2>/dev/null))
 brew update > "$update_log" 2>&1 &
 update_pid=$!
 
@@ -283,13 +285,13 @@ while kill -0 "$update_pid" 2>/dev/null; do
   local spin_pos=$(( spin_idx % spin_count ))
   local spin_char="$SPIN_FRAMES[$spin_pos]"
 
-  # 从日志提取当前正在更新的源（如 "homebrew/core" 或 tap 名）
-  local current_tap=""
-  [[ -f "$update_log" ]] && current_tap=$(grep -oE '(homebrew/[a-z/]+|[a-z0-9_-]+/[a-z0-9_-]+)' "$update_log" 2>/dev/null | tail -1)
+  # 从日志提取最后一条 ==> 开头的行作为当前步骤
+  local current_step=""
+  [[ -f "$update_log" ]] && current_step=$(grep -E '^==>' "$update_log" 2>/dev/null | tail -1 | sed 's/^==> //')
 
   _cursor_up 1
-  if [[ -n "$current_tap" ]]; then
-    echo "${C_PRIMARY}${spin_char}${C_RESET} ${C_INFO}正在更新源${C_RESET} ${C_MUTED}${current_tap}${C_RESET} ${C_MUTED}· ${elapsed}s${C_RESET}        "
+  if [[ -n "$current_step" ]]; then
+    echo "${C_PRIMARY}${spin_char}${C_RESET} ${C_INFO}${current_step}${C_RESET} ${C_MUTED}· ${elapsed}s${C_RESET}        "
   else
     echo "${C_PRIMARY}${spin_char}${C_RESET} ${C_INFO}正在更新源...${C_RESET} ${C_MUTED}· ${elapsed}s${C_RESET}        "
   fi
@@ -306,13 +308,23 @@ update_dur=$(( update_end - update_start ))
 
 _cursor_up 1
 if (( update_exit == 0 )); then
-  # 从日志提取所有更新过的源
-  local updated_taps=$(grep -oE '(homebrew/[a-z/]+|[a-z0-9_-]+/[a-z0-9_-]+)' "$update_log" 2>/dev/null | sort -u | tr '\n' ' ')
+  # 从日志里精准匹配已安装的 tap
+  local updated_taps=""
+  local tap
+  for tap in $installed_taps; do
+    if grep -q "$tap" "$update_log" 2>/dev/null; then
+      updated_taps="${updated_taps}${tap} "
+    fi
+  done
+  # 检查 homebrew/core（默认核心仓库）
+  grep -qE '(homebrew/core|Updated.*tap)' "$update_log" 2>/dev/null && updated_taps="${updated_taps}homebrew/core "
+
   if [[ -n "$updated_taps" ]]; then
     echo "${C_SUCCESS}  ✓${C_RESET} ${C_MUTED}源更新完成 · ${update_dur}s${C_RESET}"
     echo "${C_MUTED}  已更新: ${updated_taps}${C_RESET}"
   else
     echo "${C_SUCCESS}  ✓${C_RESET} ${C_MUTED}源更新完成 · ${update_dur}s${C_RESET}"
+    echo "${C_MUTED}  (所有源已是最新)${C_RESET}"
   fi
 else
   echo "${C_ERROR}  ✗ 源更新失败 · ${update_dur}s${C_RESET}"
