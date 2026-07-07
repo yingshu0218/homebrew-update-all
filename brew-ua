@@ -265,8 +265,6 @@ total_start=$(date +%s)
 _section_title "🔄" "更新 Homebrew 源"
 
 update_log="/tmp/brew-ua-update.log"
-# 获取已安装的 tap 列表，用于精准匹配
-installed_taps=($(brew tap 2>/dev/null))
 brew update > "$update_log" 2>&1 &
 update_pid=$!
 
@@ -285,13 +283,13 @@ while kill -0 "$update_pid" 2>/dev/null; do
   local spin_pos=$(( spin_idx % spin_count ))
   local spin_char="$SPIN_FRAMES[$spin_pos]"
 
-  # 从日志提取最后一条 ==> 开头的行作为当前步骤
-  local current_step=""
-  [[ -f "$update_log" ]] && current_step=$(grep -E '^==>' "$update_log" 2>/dev/null | tail -1 | sed 's/^==> //')
+  # 从日志提取当前正在更新的源（如 "homebrew/core" 或 tap 名）
+  local current_tap=""
+  [[ -f "$update_log" ]] && current_tap=$(grep -oE '(homebrew/[a-z/]+|[a-z0-9_-]+/[a-z0-9_-]+)' "$update_log" 2>/dev/null | tail -1)
 
   _cursor_up 1
-  if [[ -n "$current_step" ]]; then
-    echo "${C_PRIMARY}${spin_char}${C_RESET} ${C_INFO}${current_step}${C_RESET} ${C_MUTED}· ${elapsed}s${C_RESET}        "
+  if [[ -n "$current_tap" ]]; then
+    echo "${C_PRIMARY}${spin_char}${C_RESET} ${C_INFO}正在更新源${C_RESET} ${C_MUTED}${current_tap}${C_RESET} ${C_MUTED}· ${elapsed}s${C_RESET}        "
   else
     echo "${C_PRIMARY}${spin_char}${C_RESET} ${C_INFO}正在更新源...${C_RESET} ${C_MUTED}· ${elapsed}s${C_RESET}        "
   fi
@@ -308,23 +306,13 @@ update_dur=$(( update_end - update_start ))
 
 _cursor_up 1
 if (( update_exit == 0 )); then
-  # 从日志里精准匹配已安装的 tap
-  local updated_taps=""
-  local tap
-  for tap in $installed_taps; do
-    if grep -q "$tap" "$update_log" 2>/dev/null; then
-      updated_taps="${updated_taps}${tap} "
-    fi
-  done
-  # 检查 homebrew/core（默认核心仓库）
-  grep -qE '(homebrew/core|Updated.*tap)' "$update_log" 2>/dev/null && updated_taps="${updated_taps}homebrew/core "
-
+  # 从日志提取所有更新过的源
+  local updated_taps=$(grep -oE '(homebrew/[a-z/]+|[a-z0-9_-]+/[a-z0-9_-]+)' "$update_log" 2>/dev/null | sort -u | tr '\n' ' ')
   if [[ -n "$updated_taps" ]]; then
     echo "${C_SUCCESS}  ✓${C_RESET} ${C_MUTED}源更新完成 · ${update_dur}s${C_RESET}"
     echo "${C_MUTED}  已更新: ${updated_taps}${C_RESET}"
   else
     echo "${C_SUCCESS}  ✓${C_RESET} ${C_MUTED}源更新完成 · ${update_dur}s${C_RESET}"
-    echo "${C_MUTED}  (所有源已是最新)${C_RESET}"
   fi
 else
   echo "${C_ERROR}  ✗ 源更新失败 · ${update_dur}s${C_RESET}"
@@ -486,24 +474,42 @@ for i in $selected; do
 
   pkg_start=$(date +%s)
   local log_file="/tmp/brew-ua-$name.log"
+
+  local cache_dir="/Library/Caches/Homebrew/downloads"
+  local cache_dir2="$HOME/Library/Caches/Homebrew/downloads"
+  local last_cache_size=0
+  if [[ -d "$cache_dir" ]]; then
+    last_cache_size=$(du -sb "$cache_dir" 2>/dev/null | awk '{print $1}' || echo 0)
+  elif [[ -d "$cache_dir2" ]]; then
+    last_cache_size=$(du -sb "$cache_dir2" 2>/dev/null | awk '{print $1}' || echo 0)
+  fi
+  [[ -z "$last_cache_size" ]] && last_cache_size=0
+
   brew upgrade "$name" > "$log_file" 2>&1 &
   brew_pid=$!
 
   spin_idx=0
-  local last_size=0
-  local last_time=$pkg_start
   local speed=0
+  local last_time=$pkg_start
   while kill -0 "$brew_pid" 2>/dev/null; do
     _cursor_up 2
 
-    local current_size=0
-    [[ -f "$log_file" ]] && current_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
-    [[ -z "$current_size" ]] && current_size=0
+    local current_cache_size=0
+    if [[ -d "$cache_dir" ]]; then
+      current_cache_size=$(du -sb "$cache_dir" 2>/dev/null | awk '{print $1}' || echo 0)
+    elif [[ -d "$cache_dir2" ]]; then
+      current_cache_size=$(du -sb "$cache_dir2" 2>/dev/null | awk '{print $1}' || echo 0)
+    fi
+    [[ -z "$current_cache_size" ]] && current_cache_size=0
+
     local now=$(date +%s)
     local dt=$(( now - last_time ))
-    if (( dt >= 1 && current_size >= last_size )); then
-      speed=$(( (current_size - last_size) / dt ))
-      last_size=$current_size
+    if (( dt >= 1 && current_cache_size >= last_cache_size )); then
+      local diff=$(( current_cache_size - last_cache_size ))
+      if (( diff > 0 )); then
+        speed=$(( diff / dt ))
+      fi
+      last_cache_size=$current_cache_size
       last_time=$now
     fi
 
