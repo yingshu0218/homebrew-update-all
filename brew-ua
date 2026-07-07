@@ -162,21 +162,25 @@ function _line_centered() {
 }
 
 function _progress_bar() {
-  local current=$1 total=$2 label="$3"
+  local current_bytes=$1 total_bytes=$2 current_idx=$3 total_pkgs=$4
   local width
   width=$(_get_terminal_width)
   (( width = width < 60 ? 60 : width ))
 
-  local bar_width=$(( width - 20 ))
+  local bar_width=$(( width - 26 ))
   (( bar_width < 10 )) && bar_width=10
 
-  local percent=$(( current * 100 / total ))
-  local filled=$(( current * bar_width / total ))
+  local percent=0
+  local filled=0
+  if (( total_bytes > 0 )); then
+    percent=$(( current_bytes * 100 / total_bytes ))
+    filled=$(( current_bytes * bar_width / total_bytes ))
+  fi
   local empty=$(( bar_width - filled ))
 
   local bar="${C_PROGRESS_FG}$(_repeat_char "█" "$filled")${C_PROGRESS_BG}$(_repeat_char "░" "$empty")${C_RESET}"
 
-  printf "\r${C_BORDER}${B_V}${C_RESET} ${bar} ${C_BOLD}${C_PRIMARY}%3d%%${C_RESET} ${C_MUTED}(%d/%d)${C_RESET} ${C_BORDER}${B_V}${C_RESET}" "$percent" "$current" "$total"
+  printf "\r${C_BORDER}${B_V}${C_RESET} ${bar} ${C_BOLD}${C_PRIMARY}%3d%%${C_RESET} ${C_MUTED}(%d/%d)${C_RESET} ${C_BORDER}${B_V}${C_RESET}" "$percent" "$current_idx" "$total_pkgs"
 }
 
 function _section_title() {
@@ -233,6 +237,36 @@ function _progress_bar_with_spinner() {
   local pad=$(( width - 2 - visible ))
   (( pad < 1 )) && pad=1
   echo "${C_BORDER}${B_V}${C_RESET}${status_line}${C_BORDER}$(printf "%${pad}s" " ")${B_V}${C_RESET}"
+}
+
+function _sub_progress_bar() {
+  local current=$1 total=$2 status_text="$3"
+  local width
+  width=$(_get_terminal_width)
+  (( width = width < 60 ? 60 : width ))
+
+  local bar_width=$(( width - 30 ))
+  (( bar_width < 10 )) && bar_width=10
+
+  local percent=0
+  local filled=0
+  if (( total > 0 )); then
+    percent=$(( current * 100 / total ))
+    filled=$(( current * bar_width / total ))
+  fi
+  local empty=$(( bar_width - filled ))
+
+  local bar="${C_ACCENT}$(_repeat_char "▌" "$filled")${C_PROGRESS_BG}$(_repeat_char "░" "$empty")${C_RESET}"
+  local percent_str
+  percent_str=$(printf "%3d%%" "$percent")
+  local line="     ${bar} ${C_BOLD}${C_ACCENT}${percent_str}${C_RESET} ${C_INFO}${status_text}${C_RESET}"
+
+  local visible=0
+  local stripped="${line//$'\033'[0-9;]*[a-zA-Z]/}"
+  visible=${#stripped}
+  local pad=$(( width - 2 - visible ))
+  (( pad < 1 )) && pad=1
+  echo "${C_BORDER}${B_V}${C_RESET}${line}${C_BORDER}$(printf "%${pad}s" " ")${B_V}${C_RESET}"
 }
 
 # ---------- 参数解析 ----------
@@ -424,6 +458,42 @@ num_selected=${#selected[@]}
 echo ""
 echo "${C_INFO}  ℹ 已选择 ${C_BOLD}${num_selected}${C_RESET}${C_INFO} 个包进行升级${C_RESET}"
 
+# ---- 预先获取所有选中包的大小 ----
+pkg_sizes=()
+pkg_names=()
+pkg_types=()
+pkg_type_colors=()
+pkg_type_icons=()
+total_size=0
+
+for i in $selected; do
+  if [[ $i -le $num_f ]]; then
+    name=$formulae[$i]
+    type="formula"
+    type_color="$C_FORMULA"
+    type_icon="🍺"
+    size=$(brew info --json=v2 "$name" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['formulae'][0].get('installed_size',0) or d['formulae'][0].get('size',0) or 0)" 2>/dev/null || echo 0)
+  else
+    name=$casks[$((i - num_f))]
+    type="cask"
+    type_color="$C_CASK"
+    type_icon="📱"
+    size=$(brew info --cask --json=v2 "$name" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['casks'][0].get('size',0) or 0)" 2>/dev/null || echo 0)
+  fi
+  [[ -z "$size" ]] && size=0
+  (( size < 0 )) && size=0
+  pkg_sizes+=("$size")
+  pkg_names+=("$name")
+  pkg_types+=("$type")
+  pkg_type_colors+=("$type_color")
+  pkg_type_icons+=("$type_icon")
+  total_size=$(( total_size + size ))
+done
+
+(( total_size <= 0 )) && total_size=1
+
+echo "${C_INFO}  ℹ 总下载大小约 ${C_BOLD}$(_fmt_size $total_size)${C_RESET}"
+
 # ---- 逐个升级 ----
 echo ""
 _draw_top_border "🚀 升级进度"
@@ -435,55 +505,48 @@ failed_names=()
 success_names=()
 pkg_times=()
 current_idx=0
+completed_size=0
 
 _hide_cursor
 trap '_show_cursor' EXIT INT TERM
 
-_progress_bar 0 "$num_selected"
+_progress_bar 0 "$total_size" 0 "$num_selected"
 echo ""
+_line_left "  ${C_MUTED}等待开始...${C_RESET}"
 
-for i in $selected; do
+for (( idx=1; idx<=num_selected; idx++ )); do
   ((current_idx++))
 
-  if [[ $i -le $num_f ]]; then
-    name=$formulae[$i]
-    type="formula"
-    type_color="$C_FORMULA"
-    type_icon="🍺"
-  else
-    name=$casks[$((i - num_f))]
-    type="cask"
-    type_color="$C_CASK"
-    type_icon="📱"
-  fi
+  name=${pkg_names[$idx]}
+  type=${pkg_types[$idx]}
+  type_color=${pkg_type_colors[$idx]}
+  type_icon=${pkg_type_icons[$idx]}
+  pkg_size=${pkg_sizes[$idx]}
 
-  local pkg_size=0
-  if [[ "$type" == "formula" ]]; then
-    pkg_size=$(brew info --json=v2 "$name" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['formulae'][0].get('installed_size',0) or d['formulae'][0].get('size',0) or 0)" 2>/dev/null || echo 0)
-  else
-    pkg_size=$(brew info --cask --json=v2 "$name" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['casks'][0].get('size',0) or 0)" 2>/dev/null || echo 0)
-  fi
-  [[ -z "$pkg_size" ]] && pkg_size=0
   local size_display=""
   (( pkg_size > 0 )) && size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
 
-  _cursor_up 1
-  echo "${C_BORDER}${B_V}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}准备中...${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
-  _progress_bar "$(( current_idx - 1 ))" "$num_selected"
+  _cursor_up 2
+  local status_line="${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}准备中...${C_RESET}"
+  _line_left "  ${status_line}"
+  _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
   echo ""
+  _sub_progress_bar 0 0 "等待下载..."
 
   pkg_start=$(date +%s)
   local log_file="/tmp/brew-ua-$name.log"
 
   local cache_dir="/Library/Caches/Homebrew/downloads"
   local cache_dir2="$HOME/Library/Caches/Homebrew/downloads"
+  local initial_cache_size=0
   local last_cache_size=0
   if [[ -d "$cache_dir" ]]; then
-    last_cache_size=$(du -sb "$cache_dir" 2>/dev/null | awk '{print $1}' || echo 0)
+    initial_cache_size=$(du -sb "$cache_dir" 2>/dev/null | awk '{print $1}' || echo 0)
   elif [[ -d "$cache_dir2" ]]; then
-    last_cache_size=$(du -sb "$cache_dir2" 2>/dev/null | awk '{print $1}' || echo 0)
+    initial_cache_size=$(du -sb "$cache_dir2" 2>/dev/null | awk '{print $1}' || echo 0)
   fi
-  [[ -z "$last_cache_size" ]] && last_cache_size=0
+  [[ -z "$initial_cache_size" ]] && initial_cache_size=0
+  last_cache_size=$initial_cache_size
 
   brew upgrade "$name" > "$log_file" 2>&1 &
   brew_pid=$!
@@ -491,8 +554,10 @@ for i in $selected; do
   spin_idx=0
   local speed=0
   local last_time=$pkg_start
+  local downloaded=0
+  local phase="下载中"
   while kill -0 "$brew_pid" 2>/dev/null; do
-    _cursor_up 2
+    _cursor_up 3
 
     local current_cache_size=0
     if [[ -d "$cache_dir" ]]; then
@@ -513,6 +578,17 @@ for i in $selected; do
       last_time=$now
     fi
 
+    downloaded=$(( current_cache_size - initial_cache_size ))
+    (( downloaded < 0 )) && downloaded=0
+
+    if (( downloaded > 0 && pkg_size > 0 && downloaded < pkg_size )); then
+      phase="下载中"
+    elif (( pkg_size > 0 && downloaded >= pkg_size )); then
+      phase="安装中"
+    else
+      phase="处理中"
+    fi
+
     local speed_display=""
     if (( speed > 0 )); then
       speed_display=" ${C_MUTED}· $(_fmt_speed $speed)${C_RESET}"
@@ -522,10 +598,25 @@ for i in $selected; do
     local spin_pos=$(( spin_idx % spin_count ))
     local spin_char="$SPIN_FRAMES[$spin_pos]"
 
-    local status_text="升级中..."
-    echo "${C_BORDER}${B_V}${C_RESET} ${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display}${speed_display} ${C_INFO}${status_text}${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
-    _progress_bar "$(( current_idx - 1 ))" "$num_selected"
+    local current_total_progress=$(( completed_size + downloaded ))
+    (( current_total_progress > total_size )) && current_total_progress=$total_size
+
+    local pkg_status_line="${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display}${speed_display} ${C_INFO}${phase}...${C_RESET}"
+    _line_left "  ${pkg_status_line}"
+    _progress_bar "$current_total_progress" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
     echo ""
+
+    local sub_current=$downloaded
+    local sub_total=$pkg_size
+    if (( pkg_size <= 0 )); then
+      sub_current=0
+      sub_total=0
+    fi
+    if (( downloaded > pkg_size && pkg_size > 0 )); then
+      sub_current=$pkg_size
+    fi
+    _sub_progress_bar "$sub_current" "$sub_total" "$phase"
+
     spin_idx=$(( spin_idx + 1 ))
     sleep 0.1
   done
@@ -537,23 +628,27 @@ for i in $selected; do
   pkg_dur=$(( pkg_end - pkg_start ))
   pkg_times+=("$pkg_dur")
 
-  _cursor_up 2
+  _cursor_up 3
 
   if (( brew_exit == 0 )); then
     success_count=$(( success_count + 1 ))
     success_names+=("$name")
+    completed_size=$(( completed_size + pkg_size ))
+    (( completed_size > total_size )) && completed_size=$total_size
     echo "${C_BORDER}${B_V}${C_RESET} ${C_SUCCESS}✓${C_RESET} ${type_color}${name}${C_RESET} ${C_MUTED}升级完成 · $(_fmt_duration $pkg_dur)${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
   else
     fail_count=$(( fail_count + 1 ))
     failed_names+=("$name")
+    completed_size=$(( completed_size + pkg_size ))
+    (( completed_size > total_size )) && completed_size=$total_size
     echo "${C_BORDER}${B_V}${C_RESET} ${C_ERROR}✗${C_RESET} ${type_color}${name}${C_RESET} ${C_ERROR}升级失败${C_RESET} ${C_MUTED}· $(_fmt_duration $pkg_dur)${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
   fi
 
-  _progress_bar "$current_idx" "$num_selected"
+  _progress_bar "$completed_size" "$total_size" "$current_idx" "$num_selected"
   echo ""
+  _line_left "  ${C_MUTED}$([[ $current_idx -lt $num_selected ]] && echo "下一个准备中..." || echo "全部完成")${C_RESET}"
 done
 
-_cursor_up 1
 _show_cursor
 trap - EXIT INT TERM
 
