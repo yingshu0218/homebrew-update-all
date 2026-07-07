@@ -474,24 +474,42 @@ for i in $selected; do
 
   pkg_start=$(date +%s)
   local log_file="/tmp/brew-ua-$name.log"
+
+  local cache_dir="/Library/Caches/Homebrew/downloads"
+  local cache_dir2="$HOME/Library/Caches/Homebrew/downloads"
+  local last_cache_size=0
+  if [[ -d "$cache_dir" ]]; then
+    last_cache_size=$(du -sb "$cache_dir" 2>/dev/null | awk '{print $1}' || echo 0)
+  elif [[ -d "$cache_dir2" ]]; then
+    last_cache_size=$(du -sb "$cache_dir2" 2>/dev/null | awk '{print $1}' || echo 0)
+  fi
+  [[ -z "$last_cache_size" ]] && last_cache_size=0
+
   brew upgrade "$name" > "$log_file" 2>&1 &
   brew_pid=$!
 
   spin_idx=0
-  local last_size=0
-  local last_time=$pkg_start
   local speed=0
+  local last_time=$pkg_start
   while kill -0 "$brew_pid" 2>/dev/null; do
     _cursor_up 2
 
-    local current_size=0
-    [[ -f "$log_file" ]] && current_size=$(wc -c < "$log_file" 2>/dev/null || echo 0)
-    [[ -z "$current_size" ]] && current_size=0
+    local current_cache_size=0
+    if [[ -d "$cache_dir" ]]; then
+      current_cache_size=$(du -sb "$cache_dir" 2>/dev/null | awk '{print $1}' || echo 0)
+    elif [[ -d "$cache_dir2" ]]; then
+      current_cache_size=$(du -sb "$cache_dir2" 2>/dev/null | awk '{print $1}' || echo 0)
+    fi
+    [[ -z "$current_cache_size" ]] && current_cache_size=0
+
     local now=$(date +%s)
     local dt=$(( now - last_time ))
-    if (( dt >= 1 && current_size >= last_size )); then
-      speed=$(( (current_size - last_size) / dt ))
-      last_size=$current_size
+    if (( dt >= 1 && current_cache_size >= last_cache_size )); then
+      local diff=$(( current_cache_size - last_cache_size ))
+      if (( diff > 0 )); then
+        speed=$(( diff / dt ))
+      fi
+      last_cache_size=$current_cache_size
       last_time=$now
     fi
 
