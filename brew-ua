@@ -1011,7 +1011,11 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   [[ -z "$initial_cache_size" ]] && initial_cache_size=0
   last_cache_size=$initial_cache_size
 
-  brew upgrade "$name" > "$log_file" 2>&1 &
+  if [[ "$type" == "cask" ]]; then
+    brew upgrade --cask "$name" > "$log_file" 2>&1 &
+  else
+    brew upgrade --formula "$name" > "$log_file" 2>&1 &
+  fi
   brew_pid=$!
 
   spin_idx=0
