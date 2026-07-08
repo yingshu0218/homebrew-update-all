@@ -638,6 +638,27 @@ for i in $selected; do
     type_color="$C_CASK"
     type_icon="📱"
     size=$(brew info --cask --json=v2 "$name" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['casks'][0].get('size',0) or 0)" 2>/dev/null || echo 0)
+    if (( size <= 0 )); then
+      local fetch_output
+      fetch_output=$(brew fetch --dry-run --cask "$name" 2>&1)
+      local size_str
+      size_str=$(echo "$fetch_output" | grep -oE '[0-9.]+ [KMG]B' | head -1)
+      if [[ -n "$size_str" ]]; then
+        local num=$(echo "$size_str" | awk '{print $1}')
+        local unit=$(echo "$size_str" | awk '{print $2}')
+        if [[ "$unit" == "KB" ]]; then
+          size=$(echo "$num * 1024" | bc | awk '{print int($1)}')
+        elif [[ "$unit" == "MB" ]]; then
+          size=$(echo "$num * 1024 * 1024" | bc | awk '{print int($1)}')
+        elif [[ "$unit" == "GB" ]]; then
+          size=$(echo "$num * 1024 * 1024 * 1024" | bc | awk '{print int($1)}')
+        else
+          size=0
+        fi
+      else
+        size=0
+      fi
+    fi
   fi
   [[ -z "$size" ]] && size=0
   (( size < 0 )) && size=0
