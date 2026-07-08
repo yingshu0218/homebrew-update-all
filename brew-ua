@@ -499,8 +499,7 @@ if (( num_f > 0 )); then
   local idx=0
   for f in "${formulae[@]}"; do
     ((idx++))
-    local num_str
-    num_str=$(printf "%3d" "$idx")
+    local num_str=$(printf "%3d" "$idx")
     _line_left "  ${C_MUTED}[${C_RESET}${C_PRIMARY}${C_BOLD}${num_str}${C_RESET}${C_MUTED}]${C_RESET}  ${C_FORMULA}${f}${C_RESET}"
   done
 fi
@@ -515,8 +514,7 @@ if (( num_c > 0 )); then
   local idx=$num_f
   for c in "${casks[@]}"; do
     ((idx++))
-    local num_str
-    num_str=$(printf "%3d" "$idx")
+    local num_str=$(printf "%3d" "$idx")
     _line_left "  ${C_MUTED}[${C_RESET}${C_PRIMARY}${C_BOLD}${num_str}${C_RESET}${C_MUTED}]${C_RESET}  ${C_CASK}${c}${C_RESET}"
   done
 fi
