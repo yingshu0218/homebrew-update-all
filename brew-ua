@@ -916,7 +916,7 @@ for i in $selected; do
     type_color="$C_CASK"
     type_icon="📱"
     size=$(brew info --cask --json=v2 "$name" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['casks'][0].get('size',0) or 0)" 2>/dev/null || echo 0)
-    if (( size <= 0 )); then
+    if (( size <= 1 )); then
       local fetch_output
       fetch_output=$(brew fetch --dry-run --cask "$name" 2>&1)
       local size_str
@@ -940,6 +940,7 @@ for i in $selected; do
   fi
   [[ -z "$size" ]] && size=0
   (( size < 0 )) && size=0
+  (( size <= 1 )) && size=0
   pkg_sizes+=("$size")
   pkg_names+=("$name")
   pkg_types+=("$type")
