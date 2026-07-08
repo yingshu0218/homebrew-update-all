@@ -983,7 +983,11 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   pkg_size=${pkg_sizes[$idx]}
 
   local size_display=""
-  (( pkg_size > 0 )) && size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
+  if (( pkg_size > 0 )); then
+    size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
+  else
+    size_display=" ${C_MUTED}· ?${C_RESET}"
+  fi
 
   _cursor_up 2
   local status_line="${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}准备中...${C_RESET}"
@@ -1048,10 +1052,7 @@ for (( idx=1; idx<=num_selected; idx++ )); do
       phase="处理中"
     fi
 
-    local speed_display=""
-    if (( speed > 0 )); then
-      speed_display=" ${C_MUTED}· $(_fmt_speed $speed)${C_RESET}"
-    fi
+    local speed_display=" ${C_MUTED}· $(_fmt_speed $speed)${C_RESET}"
 
     local spin_count=${#SPIN_FRAMES[@]}
     local spin_pos=$(( spin_idx % spin_count ))
