@@ -39,17 +39,17 @@ function _print_help() {
   cat <<EOF
 ${C_BOLD}brew ua${C_RESET} — 逐个升级 Homebrew formula 和 cask
 
-${C_BOLD}用法:${C_RESET}
-  brew ua [模式] [选项]
-  brew ua ignore <cask>      屏蔽指定 cask（暂不更新）
-  brew ua unignore <cask>    解除指定 cask 的屏蔽
-  brew ua ignored            查看屏蔽列表
+${C_BOLD}升级模式:${C_RESET}
+  ${C_PRIMARY}（空）${C_RESET}      交互模式，输入序号选择
+  ${C_PRIMARY}a / auto${C_RESET}     自动模式，全部升级
+  ${C_PRIMARY}f / formula${C_RESET}  只升级 formula
+  ${C_PRIMARY}c / cask${C_RESET}     只升级 cask
 
-${C_BOLD}模式:${C_RESET}
-  ${C_PRIMARY}（空）${C_RESET}      交互模式，输入序号选择要升级的包
-  ${C_PRIMARY}auto${C_RESET}        自动模式，全部升级
-  ${C_PRIMARY}formula${C_RESET}     只升级 formula（交互模式）
-  ${C_PRIMARY}cask${C_RESET}        只升级 cask（交互模式）
+${C_BOLD}子命令:${C_RESET}
+  ${C_PRIMARY}ck / check${C_RESET}              运行环境诊断
+  ${C_PRIMARY}ig / ignore <cask>${C_RESET}       屏蔽指定 cask
+  ${C_PRIMARY}uig / unignore <cask>${C_RESET}    解除屏蔽
+  ${C_PRIMARY}igl / ignored${C_RESET}            查看屏蔽列表
 
 ${C_BOLD}选项:${C_RESET}
   ${C_PRIMARY}-a${C_RESET}           包含自带自动更新的 cask（--greedy）
@@ -57,14 +57,14 @@ ${C_BOLD}选项:${C_RESET}
   ${C_PRIMARY}--clean-logs${C_RESET}  升级后清理本次产生的临时日志
 
 ${C_BOLD}示例:${C_RESET}
-  brew ua               交互选择
-  brew ua auto          自动全部升级
-  brew ua formula       只升级 formula
-  brew ua cask -a       只升级 cask（含自动更新的应用）
-  brew ua auto -a       自动全部升级（含自动更新的应用）
-  brew ua ignore firefox       屏蔽 firefox 的更新
-  brew ua unignore firefox     解除 firefox 的屏蔽
-  brew ua ignored              查看屏蔽列表
+  brew ua                     交互选择
+  brew ua a                   自动全部升级
+  brew ua f                   只升级 formula
+  brew ua c -a                只升级 cask（含自动更新的应用）
+  brew ua ck                  运行环境诊断
+  brew ua ig firefox          屏蔽 firefox
+  brew ua uig firefox         解除 firefox 屏蔽
+  brew ua igl                 查看屏蔽列表
 EOF
 }
 
@@ -113,6 +113,274 @@ function _fmt_speed() {
 function _get_terminal_width() {
   local w=${COLUMNS:-80}
   echo "$w"
+}
+
+# ---------- 诊断功能 ----------
+
+function _ping_host() {
+  local host="$1" timeout="${2:-5}"
+  local result
+  result=$(curl -o /dev/null -s -w "%{time_total},%{http_code}" --max-time "$timeout" "$host" 2>/dev/null)
+  echo "$result"
+}
+
+function _fmt_ping() {
+  local time_ms="$1"
+  if [[ -z "$time_ms" || "$time_ms" == "0" ]]; then
+    echo "${C_ERROR}超时${C_RESET}"
+  elif (( $(echo "$time_ms < 0.5" | bc -l) )); then
+    echo "${C_SUCCESS}$(printf "%.0f" $(echo "$time_ms * 1000" | bc))ms${C_RESET}"
+  elif (( $(echo "$time_ms < 1.5" | bc -l) )); then
+    echo "${C_WARN}$(printf "%.0f" $(echo "$time_ms * 1000" | bc))ms${C_RESET}"
+  else
+    echo "${C_ERROR}$(printf "%.0f" $(echo "$time_ms * 1000" | bc))ms${C_RESET}"
+  fi
+}
+
+function _check_network() {
+  echo "${C_BOLD}📡 网络环境检测${C_RESET}"
+  echo ""
+
+  # 地理位置检测
+  echo -n "  ${C_MUTED}地理位置:${C_RESET} "
+  local geo_info
+  geo_info=$(curl -s --max-time 5 "https://ipinfo.io/country" 2>/dev/null | tr -d '\n')
+  if [[ -n "$geo_info" && ${#geo_info} -le 3 ]]; then
+    if [[ "$geo_info" == "CN" ]]; then
+      echo "${C_WARN}中国大陆${C_RESET} ${C_MUTED}(建议配置国内镜像源)${C_RESET}"
+    else
+      echo "${C_SUCCESS}$geo_info${C_RESET}"
+    fi
+  else
+    echo "${C_MUTED}未知${C_RESET}"
+  fi
+
+  # GitHub 连通性
+  echo -n "  ${C_MUTED}GitHub 访问:${C_RESET} "
+  local github_ping
+  github_ping=$(_ping_host "https://github.com" 8)
+  local github_time=$(echo "$github_ping" | cut -d',' -f1)
+  local github_code=$(echo "$github_ping" | cut -d',' -f2)
+  if [[ "$github_code" == "200" || "$github_code" == "301" || "$github_code" == "302" ]]; then
+    echo "$(_fmt_ping "$github_time") ${C_MUTED}(HTTP $github_code)${C_RESET}"
+  else
+    echo "${C_ERROR}无法访问${C_RESET} ${C_MUTED}(可能需配置代理)${C_RESET}"
+  fi
+
+  # GitHub API
+  echo -n "  ${C_MUTED}GitHub API:${C_RESET}  "
+  local api_ping
+  api_ping=$(_ping_host "https://api.github.com" 8)
+  local api_time=$(echo "$api_ping" | cut -d',' -f1)
+  local api_code=$(echo "$api_ping" | cut -d',' -f2)
+  if [[ "$api_code" == "200" || "$api_code" == "403" || "$api_code" == "404" ]]; then
+    echo "$(_fmt_ping "$api_time") ${C_MUTED}(HTTP $api_code)${C_RESET}"
+  else
+    echo "${C_ERROR}无法访问${C_RESET}"
+  fi
+
+  # brew 官方源
+  echo -n "  ${C_MUTED}brew 官方源:${C_RESET} "
+  local brew_ping
+  brew_ping=$(_ping_host "https://formulae.brew.sh" 8)
+  local brew_time=$(echo "$brew_ping" | cut -d',' -f1)
+  local brew_code=$(echo "$brew_ping" | cut -d',' -f2)
+  if [[ "$brew_code" == "200" || "$brew_code" == "301" || "$brew_code" == "302" ]]; then
+    echo "$(_fmt_ping "$brew_time") ${C_MUTED}(HTTP $brew_code)${C_RESET}"
+  else
+    echo "${C_ERROR}无法访问${C_RESET}"
+  fi
+
+  # 代理检测
+  echo -n "  ${C_MUTED}代理设置:${C_RESET}  "
+  local proxy_set=""
+  [[ -n "$http_proxy" ]] && proxy_set="http_proxy"
+  [[ -n "$https_proxy" ]] && proxy_set="${proxy_set:+,}https_proxy"
+  [[ -n "$ALL_PROXY" ]] && proxy_set="${proxy_set:+,}ALL_PROXY"
+  if [[ -n "$proxy_set" ]]; then
+    echo "${C_SUCCESS}已配置${C_RESET} ${C_MUTED}($proxy_set)${C_RESET}"
+  else
+    echo "${C_WARN}未配置${C_RESET}"
+  fi
+
+  echo ""
+}
+
+function _check_taps() {
+  echo "${C_BOLD}📦 Tap 源检测${C_RESET}"
+  echo ""
+
+  local taps
+  taps=($(brew tap 2>/dev/null))
+  local tap_count=${#taps[@]}
+
+  if (( tap_count == 0 )); then
+    echo "  ${C_WARN}⚠ 未安装任何 tap${C_RESET}"
+    echo ""
+    return
+  fi
+
+  for t in "${taps[@]}"; do
+    [[ -z "$t" ]] && continue
+    local tap_url
+    tap_url=$(brew tap-info "$t" --json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d[0].get('remote',''))" 2>/dev/null)
+
+    echo -n "  ${C_MUTED}$t${C_RESET} "
+
+    # 识别国内镜像
+    local mirror_type=""
+    if [[ "$tap_url" == *"mirrors.ustc.edu.cn"* || "$tap_url" == *"ustc"* ]]; then
+      mirror_type="${C_SUCCESS}[中科大镜像]${C_RESET}"
+    elif [[ "$tap_url" == *"mirrors.tuna.tsinghua.edu.cn"* || "$tap_url" == *"tsinghua"* ]]; then
+      mirror_type="${C_SUCCESS}[清华镜像]${C_RESET}"
+    elif [[ "$tap_url" == *"mirrors.aliyun.com"* || "$tap_url" == *"aliyun"* ]]; then
+      mirror_type="${C_SUCCESS}[阿里镜像]${C_RESET}"
+    elif [[ "$tap_url" == *"github.com"* ]]; then
+      mirror_type="${C_MUTED}[官方源]${C_RESET}"
+    fi
+
+    # 检测源速度
+    local tap_speed
+    if [[ -d "$(brew --prefix)/Library/Taps/$t" ]]; then
+      local fetch_out
+      fetch_out=$(cd "$(brew --prefix)/Library/Taps/$t" && git fetch --dry-run 2>&1)
+      if [[ "$fetch_out" == *"fatal"* || "$fetch_out" == *"error"* || "$fetch_out" == *"Could not resolve"* ]]; then
+        echo "${C_ERROR}✗ 异常${C_RESET} $mirror_type"
+      else
+        echo "${C_SUCCESS}✓ 正常${C_RESET} $mirror_type"
+      fi
+    else
+      echo "${C_WARN}⚠ 路径异常${C_RESET}"
+    fi
+  done
+
+  echo ""
+}
+
+function _check_local() {
+  echo "${C_BOLD}⚙️  本地配置检测${C_RESET}"
+  echo ""
+
+  # brew 版本
+  echo -n "  ${C_MUTED}brew 版本:${C_RESET}    "
+  local brew_version
+  brew_version=$(brew --version 2>/dev/null | head -1)
+  if [[ -n "$brew_version" ]]; then
+    echo "${C_SUCCESS}$brew_version${C_RESET}"
+  else
+    echo "${C_ERROR}无法获取${C_RESET}"
+  fi
+
+  # Git 配置
+  echo -n "  ${C_MUTED}Git 配置:${C_RESET}     "
+  local git_name git_email
+  git_name=$(git config --global user.name 2>/dev/null)
+  git_email=$(git config --global user.email 2>/dev/null)
+  if [[ -n "$git_name" && -n "$git_email" ]]; then
+    echo "${C_SUCCESS}已设置${C_RESET} ${C_MUTED}($git_name)${C_RESET}"
+  else
+    echo "${C_WARN}未完全设置${C_RESET} ${C_MUTED}(brew 操作可能受影响)${C_RESET}"
+  fi
+
+  # 缓存目录
+  echo -n "  ${C_MUTED}缓存空间:${C_RESET}     "
+  local cache_dir="$HOME/Library/Caches/Homebrew"
+  if [[ -d "$cache_dir" ]]; then
+    local cache_size
+    cache_size=$(du -sh "$cache_dir" 2>/dev/null | awk '{print $1}')
+    echo "${C_INFO}$cache_size${C_RESET} ${C_MUTED}($cache_dir)${C_RESET}"
+  else
+    echo "${C_MUTED}未找到${C_RESET}"
+  fi
+
+  # 磁盘空间
+  echo -n "  ${C_MUTED}磁盘空间:${C_RESET}     "
+  local disk_info
+  disk_info=$(df -h "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')
+  if [[ -n "$disk_info" ]]; then
+    echo "${C_SUCCESS}可用 $disk_info${C_RESET}"
+  else
+    echo "${C_MUTED}未知${C_RESET}"
+  fi
+
+  # 环境变量
+  local env_vars=""
+  [[ -n "$HOMEBREW_NO_AUTO_UPDATE" ]] && env_vars="${env_vars:+,}NO_AUTO_UPDATE"
+  [[ -n "$HOMEBREW_BOTTLE_DOMAIN" ]] && env_vars="${env_vars:+,}BOTTLE_DOMAIN"
+  [[ -n "$HOMEBREW_CORE_GIT_REMOTE" ]] && env_vars="${env_vars:+,}CORE_GIT_REMOTE"
+  if [[ -n "$env_vars" ]]; then
+    echo "  ${C_MUTED}环境变量:${C_RESET}     ${C_INFO}已设置${C_RESET} ${C_MUTED}($env_vars)${C_RESET}"
+  fi
+
+  echo ""
+}
+
+function _print_diagnose_tips() {
+  local in_china="$1"
+  echo "${C_BOLD}💡 优化建议${C_RESET}"
+  echo ""
+
+  if [[ "$in_china" == "yes" ]]; then
+    echo "  ${C_WARN}检测到中国大陆网络环境，建议配置国内镜像源:${C_RESET}"
+    echo ""
+    echo "  ${C_PRIMARY}中科大镜像:${C_RESET}"
+    echo "    export HOMEBREW_BREW_GIT_REMOTE=\"https://mirrors.ustc.edu.cn/brew.git\""
+    echo "    export HOMEBREW_CORE_GIT_REMOTE=\"https://mirrors.ustc.edu.cn/homebrew-core.git\""
+    echo "    export HOMEBREW_BOTTLE_DOMAIN=\"https://mirrors.ustc.edu.cn/homebrew-bottles\""
+    echo ""
+    echo "  ${C_PRIMARY}清华镜像:${C_RESET}"
+    echo "    export HOMEBREW_BREW_GIT_REMOTE=\"https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/brew.git\""
+    echo "    export HOMEBREW_CORE_GIT_REMOTE=\"https://mirrors.tuna.tsinghua.edu.cn/git/homebrew/homebrew-core.git\""
+    echo "    export HOMEBREW_BOTTLE_DOMAIN=\"https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles\""
+    echo ""
+    echo "  ${C_MUTED}将以上 export 加入 ~/.zshrc 后 source ~/.zshrc 生效${C_RESET}"
+  else
+    echo "  ${C_SUCCESS}当前网络环境良好，无需特殊配置${C_RESET}"
+  fi
+
+  echo ""
+}
+
+function _run_diagnose() {
+  local check_net=1 check_tap=1 check_local=1
+
+  # 解析诊断选项
+  for arg in "$@"; do
+    case "$arg" in
+      -n|--net) check_tap=0; check_local=0 ;;
+      -t|--tap) check_net=0; check_local=0 ;;
+      -l|--local) check_net=0; check_tap=0 ;;
+      -h|--help)
+        echo "${C_BOLD}brew ua ck${C_RESET} — 环境诊断"
+        echo ""
+        echo "${C_BOLD}用法:${C_RESET}"
+        echo "  brew ua ck          完整诊断"
+        echo "  brew ua ck -n       仅检测网络环境"
+        echo "  brew ua ck -t       仅检测 Tap 源"
+        echo "  brew ua ck -l       仅检测本地配置"
+        exit 0
+        ;;
+    esac
+  done
+
+  echo ""
+  echo "${C_BOLD}${C_PRIMARY}┌─────────────────────────────────────────────┐${C_RESET}"
+  echo "${C_BOLD}${C_PRIMARY}│         🔍 brew-update-all 诊断报告          │${C_RESET}"
+  echo "${C_BOLD}${C_PRIMARY}└─────────────────────────────────────────────┘${C_RESET}"
+  echo ""
+
+  local is_china="no"
+  local country
+  country=$(curl -s --max-time 5 "https://ipinfo.io/country" 2>/dev/null | tr -d '\n')
+  [[ "$country" == "CN" ]] && is_china="yes"
+
+  (( check_net )) && _check_network
+  (( check_tap )) && _check_taps
+  (( check_local )) && _check_local
+
+  if (( check_net && check_tap && check_local )); then
+    _print_diagnose_tips "$is_china"
+  fi
 }
 
 # ---------- 屏蔽列表功能 ----------
@@ -333,11 +601,20 @@ use_greedy=0
 clean_logs=0
 deep_prune=0
 
-# 处理子命令：ignore / unignore / ignored
-if [[ "$1" == "ignore" ]]; then
+# ========== 子命令处理 ==========
+
+# ck / check — 环境诊断
+if [[ "$1" == "ck" || "$1" == "check" ]]; then
+  shift
+  _run_diagnose "$@"
+  exit 0
+fi
+
+# ig / ignore — 屏蔽 cask
+if [[ "$1" == "ig" || "$1" == "ignore" ]]; then
   if [[ -z "$2" ]]; then
     echo "${C_ERROR}  ✗ 请指定要屏蔽的 cask 名称${C_RESET}"
-    echo "  用法: brew ua ignore <cask-name>"
+    echo "  用法: brew ua ig <cask-name>"
     exit 1
   fi
   if _add_ignored_cask "$2"; then
@@ -349,10 +626,11 @@ if [[ "$1" == "ignore" ]]; then
   exit 0
 fi
 
-if [[ "$1" == "unignore" ]]; then
+# uig / unignore — 解除屏蔽
+if [[ "$1" == "uig" || "$1" == "unignore" ]]; then
   if [[ -z "$2" ]]; then
     echo "${C_ERROR}  ✗ 请指定要解除屏蔽的 cask 名称${C_RESET}"
-    echo "  用法: brew ua unignore <cask-name>"
+    echo "  用法: brew ua uig <cask-name>"
     exit 1
   fi
   if _remove_ignored_cask "$2"; then
@@ -363,7 +641,8 @@ if [[ "$1" == "unignore" ]]; then
   exit 0
 fi
 
-if [[ "$1" == "ignored" ]]; then
+# igl / ignored — 查看屏蔽列表
+if [[ "$1" == "igl" || "$1" == "ignored" ]]; then
   local ignored_list
   ignored_list=($(_list_ignored_casks))
   local count=${#ignored_list[@]}
@@ -376,17 +655,18 @@ if [[ "$1" == "ignored" ]]; then
       [[ -n "$c" ]] && echo "  ${C_CASK}•${C_RESET} ${c}"
     done
     echo ""
-    echo "${C_MUTED}  解除屏蔽: brew ua unignore <cask-name>${C_RESET}"
+    echo "${C_MUTED}  解除屏蔽: brew ua uig <cask-name>${C_RESET}"
   fi
   exit 0
 fi
 
+# ========== 模式与选项解析 ==========
 for arg in "$@"; do
   case "$arg" in
     -a) use_greedy=1 ;;
-    auto) mode="auto" ;;
-    formula) filter="formula" ;;
-    cask) filter="cask" ;;
+    a|auto) mode="auto" ;;
+    f|formula) filter="formula" ;;
+    c|cask) filter="cask" ;;
     --clean-logs) clean_logs=1 ;;
     --prune) deep_prune=1 ;;
     -h|--help)
