@@ -777,11 +777,15 @@ formulae=()
 casks=()
 ignored_outdated_casks=()
 
+local self_update_available=0
+
 if [[ "$filter" != "cask" ]]; then
   local all_outdated_formulae=()
   all_outdated_formulae=($(brew outdated --formula --quiet))
   for f in "${all_outdated_formulae[@]}"; do
-    if [[ "$f" != "brew-update-all" ]]; then
+    if [[ "$f" == "brew-update-all" ]]; then
+      self_update_available=1
+    else
       formulae+=("$f")
     fi
   done
@@ -860,6 +864,9 @@ if (( num_ignored > 0 )); then
   echo "${C_WARN}  ⚠ 有 ${num_ignored} 个 cask 被屏蔽，不会被升级${C_RESET}"
   echo "${C_MUTED}     查看屏蔽列表: brew ua ignored${C_RESET}"
   echo "${C_MUTED}     解除屏蔽: brew ua unignore <cask-name>${C_RESET}"
+fi
+if (( self_update_available == 1 )); then
+  echo "${C_WARN}  🎉 brew-update-all 有新版本，升级完成后请执行: ${C_BOLD}brew upgrade brew-update-all${C_RESET}"
 fi
 
 # ---- 用户选择 ----
