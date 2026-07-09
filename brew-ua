@@ -778,7 +778,13 @@ casks=()
 ignored_outdated_casks=()
 
 if [[ "$filter" != "cask" ]]; then
-  formulae=($(brew outdated --formula --quiet))
+  local all_outdated_formulae=()
+  all_outdated_formulae=($(brew outdated --formula --quiet))
+  for f in "${all_outdated_formulae[@]}"; do
+    if [[ "$f" != "brew-update-all" ]]; then
+      formulae+=("$f")
+    fi
+  done
 fi
 if [[ "$filter" != "formula" ]]; then
   all_outdated_casks=($(brew outdated --cask $cask_extra_args --quiet))
