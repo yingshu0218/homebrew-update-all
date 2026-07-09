@@ -526,6 +526,12 @@ function _show_cursor() {
   printf "\033[?25h"
 }
 
+function _cleanup_and_exit() {
+  _show_cursor
+  echo ""
+  exit 130
+}
+
 function _cursor_up() {
   local n=${1:-1}
   printf "\033[%dA" "$n"
@@ -708,7 +714,8 @@ brew update > "$update_log" 2>&1 &
 update_pid=$!
 
 _hide_cursor
-trap '_show_cursor' EXIT INT TERM
+trap '_show_cursor' EXIT
+trap '_cleanup_and_exit' INT TERM
 
 update_start=$(date +%s)
 spin_idx=0
@@ -991,7 +998,8 @@ current_idx=0
 completed_size=0
 
 _hide_cursor
-trap '_show_cursor' EXIT INT TERM
+trap '_show_cursor' EXIT
+trap '_cleanup_and_exit' INT TERM
 
 _progress_bar 0 "$total_size" 0 "$num_selected"
 echo ""
