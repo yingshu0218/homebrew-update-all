@@ -500,6 +500,9 @@ function _progress_bar() {
   if (( total_bytes > 0 )); then
     percent=$(( current_bytes * 100 / total_bytes ))
     filled=$(( current_bytes * bar_width / total_bytes ))
+  elif (( total_pkgs > 0 )); then
+    percent=$(( current_idx * 100 / total_pkgs ))
+    filled=$(( current_idx * bar_width / total_pkgs ))
   fi
   local empty=$(( bar_width - filled ))
 
@@ -565,7 +568,7 @@ function _progress_bar_with_spinner() {
 }
 
 function _sub_progress_bar() {
-  local current=$1 total=$2 status_text="$3"
+  local current=$1 total=$2 status_text="$3" spin_idx=$4
   local width
   width=$(_get_terminal_width)
   (( width = width < 60 ? 60 : width ))
@@ -575,15 +578,32 @@ function _sub_progress_bar() {
 
   local percent=0
   local filled=0
+  local percent_str=""
   if (( total > 0 )); then
     percent=$(( current * 100 / total ))
     filled=$(( current * bar_width / total ))
+    percent_str=$(printf "%3d%%" "$percent")
+  else
+    percent_str="  ?"
+    local spin_count=${#SPIN_FRAMES[@]}
+    local spin_pos=$(( spin_idx % spin_count ))
+    local spin_char="$SPIN_FRAMES[$spin_pos]"
+    local half_bar=$(( bar_width / 2 - 1 ))
+    local bar_content="$(_repeat_char "░" "$half_bar")${C_ACCENT}${spin_char}${C_PROGRESS_BG}$(_repeat_char "░" $(( bar_width - half_bar - 1 )))"
+    local bar="${C_PROGRESS_BG}${bar_content}${C_RESET}"
+    local line="     ${bar} ${C_BOLD}${C_ACCENT}${percent_str} ${C_INFO}${status_text}${C_RESET}"
+
+    local visible=0
+    local stripped="${line//$'\033'[0-9;]*[a-zA-Z]/}"
+    visible=${#stripped}
+    local pad=$(( width - 2 - visible ))
+    (( pad < 1 )) && pad=1
+    echo "${C_BORDER}${B_V}${C_RESET}${line}${C_BORDER}$(printf "%${pad}s" " ")${B_V}${C_RESET}"
+    return
   fi
   local empty=$(( bar_width - filled ))
 
   local bar="${C_ACCENT}$(_repeat_char "▌" "$filled")${C_PROGRESS_BG}$(_repeat_char "░" "$empty")${C_RESET}"
-  local percent_str
-  percent_str=$(printf "%3d%%" "$percent")
   local line="     ${bar} ${C_BOLD}${C_ACCENT}${percent_str}${C_RESET} ${C_INFO}${status_text}${C_RESET}"
 
   local visible=0
@@ -949,9 +969,13 @@ for i in $selected; do
   total_size=$(( total_size + size ))
 done
 
-(( total_size <= 0 )) && total_size=1
+(( total_size <= 0 )) && total_size=0
 
-echo "${C_INFO}  ℹ 总下载大小约 ${C_BOLD}$(_fmt_size $total_size)${C_RESET}"
+if (( total_size > 0 )); then
+  echo "${C_INFO}  ℹ 总下载大小约 ${C_BOLD}$(_fmt_size $total_size)${C_RESET}"
+else
+  echo "${C_INFO}  ℹ 总下载大小约 ${C_BOLD}?${C_RESET}"
+fi
 
 # ---- 逐个升级 ----
 echo ""
@@ -994,19 +1018,17 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   _line_left "  ${status_line}"
   _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
   echo ""
-  _sub_progress_bar 0 0 "等待下载..."
+  _sub_progress_bar 0 0 "等待下载..." 0
 
   pkg_start=$(date +%s)
   local log_file="/tmp/brew-ua-$name.log"
 
-  local cache_dir="/Library/Caches/Homebrew/downloads"
-  local cache_dir2="$HOME/Library/Caches/Homebrew/downloads"
+  local cache_dir
+  cache_dir=$(brew --cache 2>/dev/null || echo "")
   local initial_cache_size=0
   local last_cache_size=0
   if [[ -d "$cache_dir" ]]; then
-    initial_cache_size=$(du -sb "$cache_dir" 2>/dev/null | awk '{print $1}' || echo 0)
-  elif [[ -d "$cache_dir2" ]]; then
-    initial_cache_size=$(du -sb "$cache_dir2" 2>/dev/null | awk '{print $1}' || echo 0)
+    initial_cache_size=$(du -sk "$cache_dir" 2>/dev/null | awk '{print $1 * 1024}' || echo 0)
   fi
   [[ -z "$initial_cache_size" ]] && initial_cache_size=0
   last_cache_size=$initial_cache_size
@@ -1028,9 +1050,7 @@ for (( idx=1; idx<=num_selected; idx++ )); do
 
     local current_cache_size=0
     if [[ -d "$cache_dir" ]]; then
-      current_cache_size=$(du -sb "$cache_dir" 2>/dev/null | awk '{print $1}' || echo 0)
-    elif [[ -d "$cache_dir2" ]]; then
-      current_cache_size=$(du -sb "$cache_dir2" 2>/dev/null | awk '{print $1}' || echo 0)
+      current_cache_size=$(du -sk "$cache_dir" 2>/dev/null | awk '{print $1 * 1024}' || echo 0)
     fi
     [[ -z "$current_cache_size" ]] && current_cache_size=0
 
@@ -1079,7 +1099,7 @@ for (( idx=1; idx<=num_selected; idx++ )); do
     if (( downloaded > pkg_size && pkg_size > 0 )); then
       sub_current=$pkg_size
     fi
-    _sub_progress_bar "$sub_current" "$sub_total" "$phase"
+    _sub_progress_bar "$sub_current" "$sub_total" "$phase" "$spin_idx"
 
     spin_idx=$(( spin_idx + 1 ))
     sleep 0.1
