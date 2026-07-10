@@ -97,6 +97,20 @@ function _fmt_size() {
   fi
 }
 
+function _parse_size() {
+  local size_str=$1
+  local num=$(echo "$size_str" | grep -oE '[0-9.]+')
+  local unit=$(echo "$size_str" | grep -oE '[KMG]B')
+  local bytes=0
+  case "$unit" in
+    KB) bytes=$(awk "BEGIN {printf \"%.0f\", $num * 1024}") ;;
+    MB) bytes=$(awk "BEGIN {printf \"%.0f\", $num * 1048576}") ;;
+    GB) bytes=$(awk "BEGIN {printf \"%.0f\", $num * 1073741824}") ;;
+    *) bytes=$(printf "%.0f" "$num") ;;
+  esac
+  echo "$bytes"
+}
+
 function _fmt_speed() {
   local bytes_per_sec=$1
   if (( bytes_per_sec < 1024 )); then
@@ -1055,7 +1069,35 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   last_cache_size=$initial_cache_size
 
   if [[ "$type" == "cask" ]]; then
-    brew upgrade --cask "$name" > "$log_file" 2>&1 &
+    _cursor_up 2
+    echo "${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}预下载中...${C_RESET}"
+    _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
+    echo ""
+    _sub_progress_bar 0 0 "下载..." 0
+
+    brew fetch --cask "$name" > "$log_file" 2>&1
+    fetch_exit=$?
+
+    local fetched_size=0
+    if (( fetch_exit == 0 )); then
+      local size_str
+      size_str=$(grep -oE '[0-9.]+ [KMG]B' "$log_file" | tail -1)
+      if [[ -n "$size_str" ]]; then
+        fetched_size=$(_parse_size "$size_str")
+      fi
+    fi
+
+    if (( fetched_size > 0 && fetched_size != pkg_size )); then
+      pkg_size=$fetched_size
+      size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
+      total_size=$(( total_size - pkg_sizes[idx] + pkg_size ))
+    fi
+
+    if (( fetch_exit == 0 )); then
+      brew reinstall --cask "$name" > "$log_file" 2>&1 &
+    else
+      brew upgrade --cask "$name" > "$log_file" 2>&1 &
+    fi
   else
     brew upgrade --formula "$name" > "$log_file" 2>&1 &
   fi
