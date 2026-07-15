@@ -971,10 +971,7 @@ for i in $selected; do
     type_icon="📱"
     size=$(brew info --cask --json=v2 "$name" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['casks'][0].get('size',0) or 0)" 2>/dev/null || echo 0)
     if (( size <= 1 )); then
-      local fetch_output
-      fetch_output=$(brew fetch --dry-run --cask "$name" 2>&1)
-      local size_str
-      size_str=$(echo "$fetch_output" | grep -oE '[0-9.]+ [KMG]B' | head -1)
+      local size_str=$(brew info --cask "$name" 2>/dev/null | grep -oE '[0-9.]+ [KMG]B' | head -1)
       if [[ -n "$size_str" ]]; then
         local num=$(echo "$size_str" | awk '{print $1}')
         local unit=$(echo "$size_str" | awk '{print $2}')
@@ -1058,8 +1055,7 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   pkg_start=$(date +%s)
   local log_file="/tmp/brew-ua-$name.log"
 
-  local cache_dir
-  cache_dir=$(brew --cache 2>/dev/null || echo "")
+  local cache_dir=$(brew --cache 2>/dev/null || echo "")
   local initial_cache_size=0
   local last_cache_size=0
   if [[ -d "$cache_dir" ]]; then
@@ -1179,8 +1175,7 @@ for (( idx=1; idx<=num_selected; idx++ )); do
       fetch_done=1
       if (( fetch_exit == 0 )); then
         if (( pkg_size <= 0 )); then
-          local size_str
-          size_str=$(grep -oE '[0-9.]+ [KMG]B' "$log_file" | tail -1)
+          local size_str=$(grep -oE '[0-9.]+ [KMG]B' "$log_file" | tail -1)
           if [[ -n "$size_str" ]]; then
             pkg_size=$(_parse_size "$size_str")
             if (( pkg_size > 0 )); then
