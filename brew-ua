@@ -1040,6 +1040,7 @@ for (( idx=1; idx<=num_selected; idx++ )); do
     brew fetch --cask "$name" > "$log_file" 2>&1 &
   else
     brew upgrade --formula "$name" > "$log_file" 2>&1 &
+    fetch_done=1
   fi
   brew_pid=$!
 
