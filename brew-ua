@@ -745,7 +745,7 @@ while kill -0 "$update_pid" 2>/dev/null; do
 
   # 从日志提取当前正在更新的源（如 "homebrew/core" 或 tap 名）
   local current_tap=""
-  [[ -f "$update_log" ]] && current_tap=$(grep -oE '(homebrew/[a-z/]+|[a-z0-9_-]+/[a-z0-9_-]+)' "$update_log" 2>/dev/null | tail -1)
+  [[ -f "$update_log" ]] && current_tap=$(grep -oE 'Updating (homebrew/[a-z]+|[a-z0-9_-]+/[a-z0-9_-]+)' "$update_log" 2>/dev/null | tail -1 | sed 's/Updating //')
 
   _cursor_up 1
   if [[ -n "$current_tap" ]]; then
@@ -767,7 +767,7 @@ update_dur=$(( update_end - update_start ))
 _cursor_up 1
 if (( update_exit == 0 )); then
   # 从日志提取所有更新过的源
-  local updated_taps=$(grep -oE '(homebrew/[a-z/]+|[a-z0-9_-]+/[a-z0-9_-]+)' "$update_log" 2>/dev/null | sort -u | tr '\n' ' ')
+  local updated_taps=$(grep -oE 'Updating (homebrew/[a-z]+|[a-z0-9_-]+/[a-z0-9_-]+)' "$update_log" 2>/dev/null | sed 's/Updating //' | sort -u | tr '\n' ' ')
   if [[ -n "$updated_taps" ]]; then
     echo "${C_SUCCESS}  ✓${C_RESET} ${C_MUTED}源更新完成 · ${update_dur}s${C_RESET}"
     echo "${C_MUTED}  已更新: ${updated_taps}${C_RESET}"
