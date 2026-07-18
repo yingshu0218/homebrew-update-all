@@ -1023,15 +1023,6 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   pkg_start=$(date +%s)
   local log_file="/tmp/brew-ua-$name.log"
 
-  local cache_dir=$(brew --cache 2>/dev/null || echo "")
-  local initial_cache_size=0
-  local last_cache_size=0
-  if [[ -d "$cache_dir" ]]; then
-    initial_cache_size=$(du -sk "$cache_dir" 2>/dev/null | awk '{print $1 * 1024}' || echo 0)
-  fi
-  [[ -z "$initial_cache_size" ]] && initial_cache_size=0
-  last_cache_size=$initial_cache_size
-
   local phase="下载中"
   local fetch_done=0
   local install_done=0
@@ -1045,12 +1036,10 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   brew_pid=$!
 
   spin_idx=0
-  local speed=0
-  local last_time=$pkg_start
   local downloaded=0
   local log_offset=0
   while kill -0 "$brew_pid" 2>/dev/null || [[ $fetch_done -eq 0 ]]; do
-    _cursor_up 3
+    _cursor_up 4
 
     local log_content=""
     if [[ -f "$log_file" ]]; then
@@ -1076,28 +1065,6 @@ for (( idx=1; idx<=num_selected; idx++ )); do
       fi
     fi
 
-    local current_cache_size=0
-    if [[ -d "$cache_dir" ]]; then
-      current_cache_size=$(du -sk "$cache_dir" 2>/dev/null | awk '{print $1 * 1024}' || echo 0)
-    fi
-    [[ -z "$current_cache_size" ]] && current_cache_size=0
-
-    local now=$(date +%s)
-    local dt=$(( now - last_time ))
-    if (( dt >= 1 && current_cache_size >= last_cache_size )); then
-      local diff=$(( current_cache_size - last_cache_size ))
-      if (( diff > 0 )); then
-        speed=$(( diff / dt ))
-      fi
-      last_cache_size=$current_cache_size
-      last_time=$now
-    fi
-
-    if [[ "$type" != "cask" ]]; then
-      downloaded=$(( current_cache_size - initial_cache_size ))
-      (( downloaded < 0 )) && downloaded=0
-    fi
-
     if [[ "$type" == "cask" && $fetch_done -eq 0 ]]; then
       phase="下载中"
     elif (( pkg_size > 0 && downloaded >= pkg_size )); then
@@ -1106,8 +1073,6 @@ for (( idx=1; idx<=num_selected; idx++ )); do
       phase="处理中"
     fi
 
-    local speed_display=" ${C_MUTED}· $(_fmt_speed $speed)${C_RESET}"
-
     local spin_count=${#SPIN_FRAMES[@]}
     local spin_pos=$(( spin_idx % spin_count ))
     local spin_char="$SPIN_FRAMES[$spin_pos]"
@@ -1115,7 +1080,7 @@ for (( idx=1; idx<=num_selected; idx++ )); do
     local current_total_progress=$(( completed_size + downloaded ))
     (( current_total_progress > total_size )) && current_total_progress=$total_size
 
-    local pkg_status_line="${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display}${speed_display} ${C_INFO}${phase}...${C_RESET}"
+    local pkg_status_line="${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}${phase}...${C_RESET}"
     _line_left "  ${pkg_status_line}"
     _progress_bar "$current_total_progress" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
     echo ""
@@ -1170,7 +1135,7 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   pkg_dur=$(( pkg_end - pkg_start ))
   pkg_times+=("$pkg_dur")
 
-  _cursor_up 3
+  _cursor_up 4
 
   if (( brew_exit == 0 )); then
     success_count=$(( success_count + 1 ))
