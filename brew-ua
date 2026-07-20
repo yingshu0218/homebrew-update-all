@@ -481,7 +481,8 @@ function _line_left() {
   local width
   width=$(_get_terminal_width)
   (( width = width < 60 ? 60 : width ))
-  local visible=${#content}
+  local stripped="${content//$'\033'[0-9;]*[a-zA-Z]/}"
+  local visible=${#stripped}
   local pad=$(( width - 2 - visible ))
   (( pad < 1 )) && pad=1
   echo "${C_BORDER}${B_V}${C_RESET} ${content}${C_BORDER}$(printf "%${pad}s" " ")${B_V}${C_RESET}"
@@ -492,7 +493,8 @@ function _line_centered() {
   local width
   width=$(_get_terminal_width)
   (( width = width < 60 ? 60 : width ))
-  local visible=${#content}
+  local stripped="${content//$'\033'[0-9;]*[a-zA-Z]/}"
+  local visible=${#stripped}
   local total_pad=$(( width - 2 - visible ))
   (( total_pad < 2 )) && total_pad=2
   local left=$(( total_pad / 2 ))
@@ -522,7 +524,7 @@ function _progress_bar() {
 
   local bar="${C_PROGRESS_FG}$(_repeat_char "█" "$filled")${C_PROGRESS_BG}$(_repeat_char "░" "$empty")${C_RESET}"
 
-  printf "\r${C_BORDER}${B_V}${C_RESET} ${bar} ${C_BOLD}${C_PRIMARY}%3d%%${C_RESET} ${C_MUTED}(%d/%d)${C_RESET} ${C_BORDER}${B_V}${C_RESET}" "$percent" "$current_idx" "$total_pkgs"
+  printf "${C_BORDER}${B_V}${C_RESET} ${bar} ${C_BOLD}${C_PRIMARY}%3d%%${C_RESET} ${C_MUTED}(%d/%d)${C_RESET} ${C_BORDER}${B_V}${C_RESET}\n" "$percent" "$current_idx" "$total_pkgs"
 }
 
 function _section_title() {
@@ -994,7 +996,6 @@ trap '_show_cursor' EXIT
 trap '_cleanup_and_exit' INT TERM
 
 _progress_bar 0 "$total_size" 0 "$num_selected"
-echo ""
 _line_left "  ${C_MUTED}等待开始...${C_RESET}"
 
 for (( idx=1; idx<=num_selected; idx++ )); do
@@ -1016,10 +1017,12 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   _cursor_up 3
   printf "\033[2K"
   local status_line="${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}准备中...${C_RESET}"
-  echo "${C_BORDER}${B_V}${C_RESET} ${status_line}${C_BORDER}$(_repeat_char " " $(( $(_get_terminal_width) - 2 - ${#status_line} )) )${B_V}${C_RESET}"
+  local stripped_status="${status_line//$'\033'[0-9;]*[a-zA-Z]/}"
+  local pad=$(( $(_get_terminal_width) - 2 - ${#stripped_status} ))
+  (( pad < 1 )) && pad=1
+  echo "${C_BORDER}${B_V}${C_RESET} ${status_line}${C_BORDER}$(printf "%${pad}s" " ")${B_V}${C_RESET}"
   printf "\033[2K"
   _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
-  echo ""
   printf "\033[2K"
   _sub_progress_bar 0 0 "等待下载..." 0
 
@@ -1092,7 +1095,6 @@ for (( idx=1; idx<=num_selected; idx++ )); do
 
     printf "\033[2K"
     _progress_bar "$current_total_progress" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
-    echo ""
 
     printf "\033[2K"
     if [[ "$type" == "cask" && $fetch_done -eq 0 && $pkg_size -gt 0 ]]; then
@@ -1163,7 +1165,6 @@ for (( idx=1; idx<=num_selected; idx++ )); do
 
   printf "\033[2K"
   _progress_bar "$completed_size" "$total_size" "$current_idx" "$num_selected"
-  echo ""
 
   printf "\033[2K"
   local next_msg=$([[ $current_idx -lt $num_selected ]] && echo "下一个准备中..." || echo "全部完成")
