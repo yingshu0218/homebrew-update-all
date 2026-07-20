@@ -1013,7 +1013,7 @@ for (( idx=1; idx<=num_selected; idx++ )); do
     size_display=" ${C_MUTED}· ?${C_RESET}"
   fi
 
-  _cursor_up 2
+  _cursor_up 3
   local status_line="${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}准备中...${C_RESET}"
   _line_left "  ${status_line}"
   _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
@@ -1039,7 +1039,7 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   local downloaded=0
   local log_offset=0
   while kill -0 "$brew_pid" 2>/dev/null || [[ $fetch_done -eq 0 ]]; do
-    _cursor_up 4
+    _cursor_up 3
 
     local log_content=""
     if [[ -f "$log_file" ]]; then
@@ -1135,7 +1135,7 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   pkg_dur=$(( pkg_end - pkg_start ))
   pkg_times+=("$pkg_dur")
 
-  _cursor_up 4
+  _cursor_up 3
 
   if (( brew_exit == 0 )); then
     success_count=$(( success_count + 1 ))
