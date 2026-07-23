@@ -995,8 +995,9 @@ _hide_cursor
 trap '_show_cursor' EXIT
 trap '_cleanup_and_exit' INT TERM
 
-_progress_bar 0 "$total_size" 0 "$num_selected"
 _line_left "  ${C_MUTED}等待开始...${C_RESET}"
+_progress_bar 0 "$total_size" 0 "$num_selected"
+_sub_progress_bar 0 0 "等待中..." 0
 
 for (( idx=1; idx<=num_selected; idx++ )); do
   ((current_idx++))
