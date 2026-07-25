@@ -1033,19 +1033,68 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   local phase="下载中"
   local fetch_done=0
   local install_done=0
+  local brew_pid=""
 
   if [[ "$type" == "cask" ]]; then
-    brew fetch --cask "$name" > "$log_file" 2>&1 &
+    # 清理3行界面，让brew原生下载进度（含速度）直接显示
+    _cursor_up 3
+    printf "\033[2K"
+    local dl_status="${C_PRIMARY}⠋${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}下载中...${C_RESET}"
+    local dl_stripped="${dl_status//$'\033'[0-9;]*[a-zA-Z]/}"
+    local dl_pad=$(( $(_get_terminal_width) - 2 - ${#dl_stripped} ))
+    (( dl_pad < 1 )) && dl_pad=1
+    echo "${C_BORDER}${B_V}${C_RESET} ${dl_status}${C_BORDER}$(printf "%${dl_pad}s" " ")${B_V}${C_RESET}"
+    # brew fetch 前台运行，原生进度条（含下载速度）直接输出到终端
+    brew fetch --cask "$name" 2>&1 | tee "$log_file" >/dev/null
+    local fetch_exit=${pipestatus[2]:-$pipestatus[1]}
+    fetch_done=1
+
+    if (( fetch_exit == 0 )); then
+      # 从日志获取包大小
+      local size_str=$(grep -oE '[0-9.]+ ?[KMG]B' "$log_file" | tail -1)
+      if [[ -n "$size_str" ]]; then
+        pkg_size=$(_parse_size "$size_str")
+        if (( pkg_size > 0 )); then
+          size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
+          total_size=$(( total_size - pkg_sizes[idx] + pkg_size ))
+          pkg_sizes[$idx]=$pkg_size
+        fi
+      fi
+      # 重新输出3行界面，进入安装阶段
+      phase="安装中"
+      brew reinstall --cask "$name" > "$log_file" 2>&1 &
+      brew_pid=$!
+      # 输出3行初始界面，供while循环覆盖
+      local pkg_status_line="${C_PRIMARY}⠋${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}${phase}...${C_RESET}"
+      local stripped_status="${pkg_status_line//$'\033'[0-9;]*[a-zA-Z]/}"
+      local pad=$(( $(_get_terminal_width) - 2 - ${#stripped_status} ))
+      (( pad < 1 )) && pad=1
+      echo "${C_BORDER}${B_V}${C_RESET} ${pkg_status_line}${C_BORDER}$(printf "%${pad}s" " ")${B_V}${C_RESET}"
+      _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
+      _sub_progress_bar "$pkg_size" "$pkg_size" "$phase" 0
+    else
+      install_done=1
+      brew_exit=$fetch_exit
+      # 补充2行输出，确保后续_cursor_up 3能正确对齐
+      _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
+      _sub_progress_bar 0 0 "下载失败" 0
+    fi
   else
+    # formula - 直接后台升级
     brew upgrade --formula "$name" > "$log_file" 2>&1 &
+    brew_pid=$!
     fetch_done=1
   fi
-  brew_pid=$!
 
+  # 安装阶段的界面更新循环（仅在有后台进程时进入）
   spin_idx=0
   local downloaded=0
   local log_offset=0
-  while kill -0 "$brew_pid" 2>/dev/null || [[ $fetch_done -eq 0 ]]; do
+  if [[ "$type" == "cask" && "$fetch_done" == "1" ]]; then
+    downloaded=$pkg_size
+  fi
+
+  while [[ -n "$brew_pid" ]] && kill -0 "$brew_pid" 2>/dev/null; do
     _cursor_up 3
     printf "\033[2K"
 
@@ -1056,26 +1105,7 @@ for (( idx=1; idx<=num_selected; idx++ )); do
       log_offset=$(( log_offset + new_bytes ))
     fi
 
-    if [[ "$type" == "cask" && $fetch_done -eq 0 ]]; then
-      local progress_match=""
-      progress_match=$(echo "$log_content" | grep -oE '[0-9.]+[KMG]B/[0-9.]+[KMG]B' | tail -1)
-      if [[ -n "$progress_match" ]]; then
-        local dl_part=$(echo "$progress_match" | cut -d'/' -f1)
-        local total_part=$(echo "$progress_match" | cut -d'/' -f2)
-        downloaded=$(_parse_size "$dl_part")
-        if (( pkg_size <= 0 )); then
-          pkg_size=$(_parse_size "$total_part")
-          if (( pkg_size > 0 )); then
-            size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
-            total_size=$(( total_size - pkg_sizes[idx] + pkg_size ))
-          fi
-        fi
-      fi
-    fi
-
-    if [[ "$type" == "cask" && $fetch_done -eq 0 ]]; then
-      phase="下载中"
-    elif (( pkg_size > 0 && downloaded >= pkg_size )); then
+    if (( pkg_size > 0 && downloaded >= pkg_size )); then
       phase="安装中"
     else
       phase="处理中"
@@ -1098,51 +1128,25 @@ for (( idx=1; idx<=num_selected; idx++ )); do
     _progress_bar "$current_total_progress" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
 
     printf "\033[2K"
-    if [[ "$type" == "cask" && $fetch_done -eq 0 && $pkg_size -gt 0 ]]; then
-      _sub_progress_bar "$downloaded" "$pkg_size" "$(_fmt_size $downloaded)/$(_fmt_size $pkg_size)" "$spin_idx"
-    else
-      local sub_current=$downloaded
-      local sub_total=$pkg_size
-      if (( pkg_size <= 0 )); then
-        sub_current=0
-        sub_total=0
-      fi
-      if (( downloaded > pkg_size && pkg_size > 0 )); then
-        sub_current=$pkg_size
-      fi
-      _sub_progress_bar "$sub_current" "$sub_total" "$phase" "$spin_idx"
+    local sub_current=$downloaded
+    local sub_total=$pkg_size
+    if (( pkg_size <= 0 )); then
+      sub_current=0
+      sub_total=0
     fi
+    if (( downloaded > pkg_size && pkg_size > 0 )); then
+      sub_current=$pkg_size
+    fi
+    _sub_progress_bar "$sub_current" "$sub_total" "$phase" "$spin_idx"
 
     spin_idx=$(( spin_idx + 1 ))
     sleep 0.1
-
-    if [[ "$type" == "cask" && $fetch_done -eq 0 ]] && ! kill -0 "$brew_pid" 2>/dev/null; then
-      wait "$brew_pid" 2>/dev/null
-      fetch_exit=$?
-      fetch_done=1
-      if (( fetch_exit == 0 )); then
-        if (( pkg_size <= 0 )); then
-          local size_str=$(grep -oE '[0-9.]+ [KMG]B' "$log_file" | tail -1)
-          if [[ -n "$size_str" ]]; then
-            pkg_size=$(_parse_size "$size_str")
-            if (( pkg_size > 0 )); then
-              size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
-              total_size=$(( total_size - pkg_sizes[idx] + pkg_size ))
-            fi
-          fi
-        fi
-        log_offset=0
-        phase="安装中"
-        brew reinstall --cask "$name" > "$log_file" 2>&1 &
-        brew_pid=$!
-      else
-        install_done=1
-      fi
-    fi
   done
 
-  wait "$brew_pid"
-  brew_exit=$?
+  if [[ -n "$brew_pid" ]]; then
+    wait "$brew_pid"
+    brew_exit=$?
+  fi
 
   pkg_end=$(date +%s)
   pkg_dur=$(( pkg_end - pkg_start ))
