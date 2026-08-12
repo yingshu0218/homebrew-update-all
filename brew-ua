@@ -721,6 +721,10 @@ done
 
 # ---------- 主流程 ----------
 
+# 高精度时间与数学函数（用于下载速度计算）
+zmodload zsh/datetime 2>/dev/null
+zmodload zsh/mathfunc 2>/dev/null
+
 # 独立临时日志目录（避免 /tmp 固定文件名冲突与符号链接风险）
 TMP_BASE=$(mktemp -d "${TMPDIR:-/tmp}/brew-ua.XXXXXX" 2>/dev/null)
 [[ -z "$TMP_BASE" || ! -d "$TMP_BASE" ]] && TMP_BASE="/tmp"
@@ -1041,31 +1045,87 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   local brew_pid=""
 
   if [[ "$type" == "cask" ]]; then
-    # 回到3行块顶并清行，存光标后画1行下载状态行
+    # 回到3行块顶，画下载界面（状态行 + 整体进度 + 子进度），后台运行 fetch
     _cursor_up 3
     printf "\033[2K"
-    printf "\033[s"
-    local dl_status="${C_PRIMARY}⠋${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}下载中...${C_RESET}"
-    local dl_stripped="${dl_status//$'\033'[0-9;]*[a-zA-Z]/}"
-    local dl_pad=$(( $(_get_terminal_width) - 2 - ${#dl_stripped} ))
-    (( dl_pad < 1 )) && dl_pad=1
-    echo "${C_BORDER}${B_V}${C_RESET} ${dl_status}${C_BORDER}$(printf "%${dl_pad}s" " ")${B_V}${C_RESET}"
-    # script 伪终端 + --verbose：curl 恢复原生仪表（含下载速度），前台运行直接上屏
-    /usr/bin/script -e -q /dev/null brew --verbose fetch --cask "$name" 2>&1 | tee "$log_file"
-    local fetch_exit=$pipestatus[1]
-    fetch_done=1
+    local dl_init="${C_PRIMARY}⠋${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}下载中...${C_RESET}"
+    local dl_init_s="${dl_init//$'\033'[0-9;]*[a-zA-Z]/}"
+    local dl_init_p=$(( $(_get_terminal_width) - 2 - ${#dl_init_s} ))
+    (( dl_init_p < 1 )) && dl_init_p=1
+    echo "${C_BORDER}${B_V}${C_RESET} ${dl_init}${C_BORDER}$(printf "%${dl_init_p}s" " ")${B_V}${C_RESET}"
+    _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
+    _sub_progress_bar 0 0 "下载中..." 0
 
-    # 恢复光标到块顶并清屏到底部，清掉状态行与 fetch 输出，统一重画 3 行
-    printf "\033[u\033[J"
-    if (( fetch_exit == 0 )); then
-      # 从日志获取包大小（tr -d '\r' 去除 curl 刷新符，head -1 取 Total 列）
-      local size_str=$(tr -d '\r' < "$log_file" | grep -oE '[0-9.]+ ?[kKMGT]i?B?' | head -1)
-      if [[ -n "$size_str" ]]; then
-        pkg_size=$(_parse_size "$size_str")
-        if (( pkg_size > 0 )); then
+    # 后台 fetch：script 伪终端 + HOMEBREW_VERBOSE=1 保证在 TTY 语义下下载（不静默）
+    # （注意：Homebrew 6.x 不接受 "brew --verbose fetch"，须用环境变量方式传全局选项）
+    /usr/bin/script -e -q /dev/null env HOMEBREW_VERBOSE=1 brew fetch --cask "$name" > "$log_file" 2>&1 &
+    local fetch_pid=$!
+
+    # 下载轮询：解析日志 "Downloading X/Y" 计算实时速度，重画 3 行界面
+    spin_idx=0
+    local downloaded=0
+    local speed_bytes=0
+    local prev_bytes=0
+    local prev_ms=$(( EPOCHREALTIME * 1000 ))
+    while kill -0 "$fetch_pid" 2>/dev/null; do
+      local dl_line=""
+      [[ -f "$log_file" ]] && dl_line=$(grep -oE 'Downloading[[:space:]]+[0-9.]+ ?[kKMGT]?i?B?[[:space:]]*/[[:space:]]*[0-9.]+ ?[kKMGT]?i?B?' "$log_file" 2>/dev/null | tail -1)
+      if [[ -n "$dl_line" ]]; then
+        local dl_cur=$(echo "$dl_line" | grep -oE '[0-9.]+ ?[kKMGT]?i?B?' | head -1)
+        local dl_tot=$(echo "$dl_line" | grep -oE '[0-9.]+ ?[kKMGT]?i?B?' | tail -1)
+        local tot_bytes=$(_parse_size "$dl_tot")
+        downloaded=$(_parse_size "$dl_cur")
+        if (( pkg_size <= 0 && tot_bytes > 0 )); then
+          pkg_size=$tot_bytes
           size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
           total_size=$(( total_size - pkg_sizes[idx] + pkg_size ))
           pkg_sizes[$idx]=$pkg_size
+        fi
+      fi
+      local now_ms=$(( EPOCHREALTIME * 1000 ))
+      local dt_ms=$(( now_ms - prev_ms ))
+      if (( dt_ms >= 200 )); then
+        local delta=$(( downloaded - prev_bytes ))
+        (( delta < 0 )) && delta=0
+        speed_bytes=$(( int(delta * 1000.0 / dt_ms) ))
+        prev_bytes=$downloaded
+        prev_ms=$now_ms
+      fi
+      local spin_count=${#SPIN_FRAMES[@]}
+      local spin_pos=$(( spin_idx % spin_count ))
+      local spin_char="$SPIN_FRAMES[$spin_pos]"
+      local speed_display=""
+      (( speed_bytes > 0 )) && speed_display=" ${C_ACCENT}$(_fmt_speed $speed_bytes)${C_RESET}"
+      _cursor_up 3
+      printf "\033[2K"
+      local dl_status="${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}下载中${C_RESET}${speed_display}"
+      local dl_stripped="${dl_status//$'\033'[0-9;]*[a-zA-Z]/}"
+      local dl_pad=$(( $(_get_terminal_width) - 2 - ${#dl_stripped} ))
+      (( dl_pad < 1 )) && dl_pad=1
+      echo "${C_BORDER}${B_V}${C_RESET} ${dl_status}${C_BORDER}$(printf "%${dl_pad}s" " ")${B_V}${C_RESET}"
+      printf "\033[2K"
+      _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
+      printf "\033[2K"
+      _sub_progress_bar "$downloaded" "$pkg_size" "下载中" "$spin_idx"
+      spin_idx=$(( spin_idx + 1 ))
+      sleep 0.1
+    done
+
+    wait "$fetch_pid"
+    local fetch_exit=$?
+    fetch_done=1
+
+    if (( fetch_exit == 0 )); then
+      # 兜底：若下载期间未解析到包大小，从日志最后一行解析
+      if (( pkg_size <= 0 )); then
+        local size_str=$(tr -d '\r' < "$log_file" | grep -oE '[0-9.]+ ?[kKMGT]i?B?' | head -1)
+        if [[ -n "$size_str" ]]; then
+          pkg_size=$(_parse_size "$size_str")
+          if (( pkg_size > 0 )); then
+            size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
+            total_size=$(( total_size - pkg_sizes[idx] + pkg_size ))
+            pkg_sizes[$idx]=$pkg_size
+          fi
         fi
       fi
       # 输出3行安装界面，进入安装阶段
