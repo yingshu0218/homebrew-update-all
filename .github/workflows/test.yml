@@ -1,0 +1,21 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: zsh 语法检查
+        run: zsh -n brew-ua
+
+      - name: 冒烟测试（stub brew，无网络）
+        run: zsh scripts/test.sh
+
+      - name: Formula 审计（Homebrew 官方规则）
+        run: brew audit --strict Formula/brew-update-all.rb

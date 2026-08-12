@@ -4,6 +4,11 @@
 #  brew-update-all  —  逐个升级 Homebrew formula 和 cask
 # ============================================================
 
+# 严格模式：未定义变量立即报错 + 管道失败传播
+# （不开 set -e：设计上要"一个包失败继续下一个"）
+setopt nounset
+setopt pipefail
+
 # ---------- 颜色主题 ----------
 autoload -U colors && colors
 
@@ -29,6 +34,19 @@ C_ACCENT=$'\033[38;5;213m'
 # ---------- 边框字符 ----------
 B_H="─" B_V="│" B_TL="┌" B_TR="┐" B_BL="└" B_BR="┘"
 B_L="├" B_R="┤" B_T="┬" B_B="┴" B_C="┼"
+
+# ---------- 非 TTY 降级 ----------
+# 管道/重定向/CI 下关闭颜色与光标控制，退化为纯文本逐行输出
+TTY_MODE=1
+[[ -t 1 ]] || TTY_MODE=0
+if (( TTY_MODE == 0 )); then
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_ITALIC=""; C_UNDERLINE=""
+  C_PRIMARY=""; C_SUCCESS=""; C_ERROR=""; C_WARN=""; C_INFO=""
+  C_FORMULA=""; C_CASK=""; C_BORDER=""; C_PROGRESS_BG=""; C_PROGRESS_FG=""
+  C_MUTED=""; C_ACCENT=""
+  B_H="-" B_V="|" B_TL="+" B_TR="+" B_BL="+" B_BR="+"
+  B_L="+" B_R="+" B_T="+" B_B="+" B_C="+"
+fi
 
 # ---------- spinner 动画帧 ----------
 SPIN_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
@@ -536,31 +554,36 @@ function _section_title() {
 }
 
 function _hide_cursor() {
-  printf "\033[?25l"
+  (( TTY_MODE )) && printf "\033[?25l"
 }
 
 function _show_cursor() {
-  printf "\033[?25h"
+  (( TTY_MODE )) && printf "\033[?25h"
 }
 
 function _cleanup_and_exit() {
   _show_cursor
+  [[ -n "${LOCK_FILE:-}" ]] && rm -f "$LOCK_FILE"
   echo ""
   exit 130
 }
 
 function _cursor_up() {
   local n=${1:-1}
-  printf "\033[%dA" "$n"
+  (( TTY_MODE )) && printf "\033[%dA" "$n"
 }
 
 function _cursor_down() {
   local n=${1:-1}
-  printf "\033[%dB" "$n"
+  (( TTY_MODE )) && printf "\033[%dB" "$n"
 }
 
 function _clear_line() {
-  printf "\r\033[K"
+  (( TTY_MODE )) && printf "\r\033[K"
+}
+
+function _clr_line() {
+  (( TTY_MODE )) && printf "\033[2K"
 }
 
 function _progress_bar_with_spinner() {
@@ -581,7 +604,7 @@ function _progress_bar_with_spinner() {
   echo "${C_BORDER}${B_V}${C_RESET} ${bar} ${C_BOLD}${C_PRIMARY}$(printf "%3d" "$percent")%%${C_RESET} ${C_MUTED}(%d/%d)${C_RESET} ${C_BORDER}${B_V}${C_RESET}" "$current" "$total"
 
   local spin_count=${#SPIN_FRAMES[@]}
-  local spin_pos=$(( spin_idx % spin_count ))
+  local spin_pos=$(( (spin_idx % spin_count) + 1 ))
   local spin_char="$SPIN_FRAMES[$spin_pos]"
   local status_line="     ${C_PRIMARY}${spin_char}${C_RESET} ${pkg_icon} ${type_color}${pkg_name}${C_RESET} ${C_MUTED}(${pkg_type})${C_RESET} ${C_INFO}升级中...${C_RESET}"
   local visible=$(( ${#pkg_name} + 30 ))
@@ -609,7 +632,7 @@ function _sub_progress_bar() {
   else
     percent_str="  ?"
     local spin_count=${#SPIN_FRAMES[@]}
-    local spin_pos=$(( spin_idx % spin_count ))
+    local spin_pos=$(( (spin_idx % spin_count) + 1 ))
     local spin_char="$SPIN_FRAMES[$spin_pos]"
     local half_bar=$(( bar_width / 2 - 1 ))
     local bar_content="$(_repeat_char "░" "$half_bar")${C_ACCENT}${spin_char}${C_PROGRESS_BG}$(_repeat_char "░" $(( bar_width - half_bar - 1 )))"
@@ -637,6 +660,124 @@ function _sub_progress_bar() {
   echo "${C_BORDER}${B_V}${C_RESET}${line}${C_BORDER}$(printf "%${pad}s" " ")${B_V}${C_RESET}"
 }
 
+# ---------- 下载阶段 ----------
+# _run_fetch <name> <type> <idx> —— 下载单个包（后台 fetch + 日志解析速度 + 超时）
+# 副作用：更新 pkg_size / size_display / pkg_sizes[idx] / total_size（供安装阶段使用）
+# 返回：0=成功 1=失败 2=超时
+function _run_fetch() {
+  local name=$1 type=$2 idx=$3
+  local fetch_flag=$([[ "$type" == "cask" ]] && echo "--cask" || echo "--formula")
+  local type_color=$([[ "$type" == "cask" ]] && echo "$C_CASK" || echo "$C_FORMULA")
+  local type_icon=$([[ "$type" == "cask" ]] && echo "📱" || echo "🍺")
+  local log_file="$TMP_BASE/$name.log"
+  local fetch_timeout=${BREW_UA_FETCH_TIMEOUT:-600}
+
+  # 回到3行块顶，画下载初始界面
+  _cursor_up 3
+  _clr_line
+  local dl_init="${C_PRIMARY}⠋${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}下载中...${C_RESET}"
+  local dl_init_s="${dl_init//$'\033'[0-9;]*[a-zA-Z]/}"
+  local dl_init_p=$(( $(_get_terminal_width) - 2 - ${#dl_init_s} ))
+  (( dl_init_p < 1 )) && dl_init_p=1
+  echo "${C_BORDER}${B_V}${C_RESET} ${dl_init}${C_BORDER}$(printf "%${dl_init_p}s" " ")${B_V}${C_RESET}"
+  _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
+  _sub_progress_bar 0 0 "下载中..." 0
+
+  # 后台 fetch：python setsid 包装 script，使 fetch 自成进程组（超时整组 kill）
+  # （Homebrew 6.x 不接受 "brew --verbose fetch"，用环境变量 HOMEBREW_VERBOSE=1）
+  local fetch_pid
+  python3 -c 'import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' /usr/bin/script -e -q /dev/null env HOMEBREW_VERBOSE=1 brew fetch "$fetch_flag" "$name" > "$log_file" 2>&1 &
+  fetch_pid=$!
+
+  # 下载轮询：解析日志 "Downloading X/Y" 算速度 + 超时检查，重画 3 行
+  spin_idx=0
+  local downloaded=0
+  local speed_bytes=0
+  local prev_bytes=0
+  local prev_ms=$(( EPOCHREALTIME * 1000 ))
+  local fetch_start=$(date +%s)
+  local timed_out=0
+  while kill -0 "$fetch_pid" 2>/dev/null; do
+    # 超时检查：超过 BREW_UA_FETCH_TIMEOUT 秒则整组终止
+    if (( $(date +%s) - fetch_start > fetch_timeout )); then
+      kill -TERM -- -$fetch_pid 2>/dev/null
+      sleep 2
+      kill -KILL -- -$fetch_pid 2>/dev/null
+      wait "$fetch_pid" 2>/dev/null
+      timed_out=1
+      break
+    fi
+    # 解析 Downloading X/Y
+    local dl_line=""
+    [[ -f "$log_file" ]] && dl_line=$(grep -oE 'Downloading[[:space:]]+[0-9.]+ ?[kKMGT]?i?B?[[:space:]]*/[[:space:]]*[0-9.]+ ?[kKMGT]?i?B?' "$log_file" 2>/dev/null | tail -1)
+    if [[ -n "$dl_line" ]]; then
+      local dl_cur=$(echo "$dl_line" | grep -oE '[0-9.]+ ?[kKMGT]?i?B?' | head -1)
+      local dl_tot=$(echo "$dl_line" | grep -oE '[0-9.]+ ?[kKMGT]?i?B?' | tail -1)
+      local tot_bytes=$(_parse_size "$dl_tot")
+      downloaded=$(_parse_size "$dl_cur")
+      if (( pkg_size <= 0 && tot_bytes > 0 )); then
+        pkg_size=$tot_bytes
+        size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
+        total_size=$(( total_size - pkg_sizes[idx] + pkg_size ))
+        pkg_sizes[$idx]=$pkg_size
+      fi
+    fi
+    # 速度计算（200ms 窗口）
+    local now_ms=$(( EPOCHREALTIME * 1000 ))
+    local dt_ms=$(( now_ms - prev_ms ))
+    if (( dt_ms >= 200 )); then
+      local delta=$(( downloaded - prev_bytes ))
+      (( delta < 0 )) && delta=0
+      speed_bytes=$(( int(delta * 1000.0 / dt_ms) ))
+      prev_bytes=$downloaded
+      prev_ms=$now_ms
+    fi
+    # 重画 3 行
+    local spin_count=${#SPIN_FRAMES[@]}
+    local spin_pos=$(( (spin_idx % spin_count) + 1 ))
+    local spin_char="$SPIN_FRAMES[$spin_pos]"
+    local speed_display=""
+    (( speed_bytes > 0 )) && speed_display=" ${C_ACCENT}$(_fmt_speed $speed_bytes)${C_RESET}"
+    _cursor_up 3
+    _clr_line
+    local dl_status="${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}下载中${C_RESET}${speed_display}"
+    local dl_stripped="${dl_status//$'\033'[0-9;]*[a-zA-Z]/}"
+    local dl_pad=$(( $(_get_terminal_width) - 2 - ${#dl_stripped} ))
+    (( dl_pad < 1 )) && dl_pad=1
+    echo "${C_BORDER}${B_V}${C_RESET} ${dl_status}${C_BORDER}$(printf "%${dl_pad}s" " ")${B_V}${C_RESET}"
+    _clr_line
+    _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
+    _clr_line
+    _sub_progress_bar "$downloaded" "$pkg_size" "下载中" "$spin_idx"
+    spin_idx=$(( spin_idx + 1 ))
+    sleep 0.1
+  done
+
+  if (( timed_out == 1 )); then
+    return 2
+  fi
+
+  wait "$fetch_pid"
+  local fetch_exit=$?
+  if (( fetch_exit != 0 )); then
+    return 1
+  fi
+
+  # 兜底：若下载期间未解析到包大小，从日志最后一行解析
+  if (( pkg_size <= 0 )); then
+    local size_str=$(tr -d '\r' < "$log_file" | grep -oE '[0-9.]+ ?[kKMGT]i?B?' | head -1)
+    if [[ -n "$size_str" ]]; then
+      pkg_size=$(_parse_size "$size_str")
+      if (( pkg_size > 0 )); then
+        size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
+        total_size=$(( total_size - pkg_sizes[idx] + pkg_size ))
+        pkg_sizes[$idx]=$pkg_size
+      fi
+    fi
+  fi
+  return 0
+}
+
 # ---------- 参数解析 ----------
 mode="interactive"
 filter="all"
@@ -647,15 +788,15 @@ deep_prune=0
 # ========== 子命令处理 ==========
 
 # ck / check — 环境诊断
-if [[ "$1" == "ck" || "$1" == "check" ]]; then
+if [[ "${1:-}" == "ck" || "${1:-}" == "check" ]]; then
   shift
   _run_diagnose "$@"
   exit 0
 fi
 
 # ig / ignore — 屏蔽 cask
-if [[ "$1" == "ig" || "$1" == "ignore" ]]; then
-  if [[ -z "$2" ]]; then
+if [[ "${1:-}" == "ig" || "${1:-}" == "ignore" ]]; then
+  if [[ -z "${2:-}" ]]; then
     echo "${C_ERROR}  ✗ 请指定要屏蔽的 cask 名称${C_RESET}"
     echo "  用法: brew ua ig <cask-name>"
     exit 1
@@ -670,8 +811,8 @@ if [[ "$1" == "ig" || "$1" == "ignore" ]]; then
 fi
 
 # uig / unignore — 解除屏蔽
-if [[ "$1" == "uig" || "$1" == "unignore" ]]; then
-  if [[ -z "$2" ]]; then
+if [[ "${1:-}" == "uig" || "${1:-}" == "unignore" ]]; then
+  if [[ -z "${2:-}" ]]; then
     echo "${C_ERROR}  ✗ 请指定要解除屏蔽的 cask 名称${C_RESET}"
     echo "  用法: brew ua uig <cask-name>"
     exit 1
@@ -685,7 +826,7 @@ if [[ "$1" == "uig" || "$1" == "unignore" ]]; then
 fi
 
 # igl / ignored — 查看屏蔽列表
-if [[ "$1" == "igl" || "$1" == "ignored" ]]; then
+if [[ "${1:-}" == "igl" || "${1:-}" == "ignored" ]]; then
   local ignored_list
   ignored_list=($(_list_ignored_casks))
   local count=${#ignored_list[@]}
@@ -729,6 +870,23 @@ zmodload zsh/mathfunc 2>/dev/null
 TMP_BASE=$(mktemp -d "${TMPDIR:-/tmp}/brew-ua.XXXXXX" 2>/dev/null)
 [[ -z "$TMP_BASE" || ! -d "$TMP_BASE" ]] && TMP_BASE="/tmp"
 
+# 当前版本（发版时同步更新；版本自检用）
+BREW_UA_VERSION="1.8.5"
+
+# 单实例锁：PID 文件 + kill -0 探测，陈旧锁自动清理
+LOCK_FILE="$HOME/.config/brew-ua/brew-ua.lock"
+mkdir -p "$HOME/.config/brew-ua"
+if [[ -f "$LOCK_FILE" ]]; then
+  local old_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+  if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+    echo "${C_ERROR}  ✗ 已有 brew-ua 实例在运行（PID $old_pid），请稍后再试${C_RESET}"
+    echo "${C_MUTED}    若确认无其他实例，可删除 ${LOCK_FILE} 后重试${C_RESET}"
+    exit 1
+  fi
+  rm -f "$LOCK_FILE"
+fi
+echo $$ > "$LOCK_FILE"
+
 total_start=$(date +%s)
 
 # ---- brew update ----
@@ -751,7 +909,7 @@ while kill -0 "$update_pid" 2>/dev/null; do
   elapsed=$(( now - update_start ))
 
   local spin_count=${#SPIN_FRAMES[@]}
-  local spin_pos=$(( spin_idx % spin_count ))
+  local spin_pos=$(( (spin_idx % spin_count) + 1 ))
   local spin_char="$SPIN_FRAMES[$spin_pos]"
 
   # 从日志提取当前正在更新的源（如 "homebrew/core" 或 tap 名）
@@ -901,17 +1059,23 @@ casks_to_ignore=()
 if [[ "$mode" == "auto" ]]; then
   selected=($(seq 1 $total))
 else
-  echo ""
-  echo "${C_BOLD}${C_PRIMARY}🎯 选择要升级的包${C_RESET}"
-  echo "${C_MUTED}  回车=全部，支持空格分隔（1 3 5）或范围（2-7）${C_RESET}"
-  echo "${C_MUTED}  屏蔽 cask: 序号+i（如 5i 表示屏蔽第5个 cask）${C_RESET}"
-  echo -n "  ${C_BOLD}输入序号:${C_RESET} "
-  read input
+  # 交互选择：支持屏蔽后循环重选，不再 exec 重跑（避免重复 brew update）
+  while true; do
+    echo ""
+    echo "${C_BOLD}${C_PRIMARY}🎯 选择要升级的包${C_RESET}"
+    echo "${C_MUTED}  回车=全部，支持空格分隔（1 3 5）或范围（2-7）${C_RESET}"
+    echo "${C_MUTED}  屏蔽 cask: 序号+i（如 5i 表示屏蔽第5个 cask）${C_RESET}"
+    echo -n "  ${C_BOLD}输入序号:${C_RESET} "
+    read input
 
-  if [[ -z "$input" ]]; then
-    selected=($(seq 1 $total))
-  else
-    local reselect=0
+    selected=()
+    casks_to_ignore=()
+
+    if [[ -z "$input" ]]; then
+      selected=($(seq 1 $total))
+      break
+    fi
+
     for token in ${(z)input}; do
       if [[ "$token" =~ ^([0-9]+)i$ ]]; then
         local ignore_idx=$match[1]
@@ -932,6 +1096,7 @@ else
         (( token >= 1 && token <= total )) && selected+=($token)
       fi
     done
+
     if (( ${#casks_to_ignore} > 0 )); then
       for c in "${casks_to_ignore[@]}"; do
         _add_ignored_cask "$c"
@@ -939,19 +1104,36 @@ else
         echo "${C_SUCCESS}  ✓ 已屏蔽 cask: ${C_BOLD}${c}${C_RESET}"
       done
       echo "${C_MUTED}  解除屏蔽: brew ua unignore <cask-name>${C_RESET}"
+      # 从 casks 剔除被屏蔽项并更新计数，循环重新选择
+      local new_casks=()
+      local c ig skip
+      for c in "${casks[@]}"; do
+        skip=0
+        for ig in "${casks_to_ignore[@]}"; do
+          [[ "$c" == "$ig" ]] && skip=1
+        done
+        (( skip == 0 )) && new_casks+=("$c")
+      done
+      casks=("${new_casks[@]}")
+      num_c=${#casks[@]}
+      total=$((num_f + num_c))
+      if (( total == 0 )); then
+        echo ""
+        echo "${C_INFO}  ℹ 没有可更新的包了${C_RESET}"
+        exit 0
+      fi
       echo ""
-      echo "${C_INFO}  ℹ 列表已更新，请重新选择${C_RESET}"
-      reselect=1
+      echo "${C_INFO}  ℹ 列表已更新（剩余 ${total} 个），请重新选择${C_RESET}"
+      continue
     fi
-    if (( reselect == 1 )); then
-      exec zsh "$0" "$@"
-    fi
+
     if (( ${#selected[@]} == 0 )); then
       echo ""
       echo "${C_ERROR}  ✗ 没有选中有效的序号，已取消${C_RESET}"
       exit 1
     fi
-  fi
+    break
+  done
 fi
 
 selected=(${(u)selected})
@@ -1004,9 +1186,18 @@ _hide_cursor
 trap '_show_cursor' EXIT
 trap '_cleanup_and_exit' INT TERM
 
-_line_left "  ${C_MUTED}等待开始...${C_RESET}"
-_progress_bar 0 "$total_size" 0 "$num_selected"
-_sub_progress_bar 0 0 "等待中..." 0
+_line_left "  ${C_MUTED}阶段 1/2：逐个下载更新包...${C_RESET}"
+_progress_bar 0 0 0 "$num_selected"
+_sub_progress_bar 0 0 "等待下载..." 0
+
+# ========== 阶段 1：逐个下载（速度/超时/失败隔离） ==========
+dl_ok_names=()
+dl_ok_types=()
+dl_ok_sizes=()
+dl_fail_names=()
+dl_fail_reasons=()
+current_idx=0
+dl_done=0
 
 for (( idx=1; idx<=num_selected; idx++ )); do
   ((current_idx++))
@@ -1025,230 +1216,196 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   fi
 
   _cursor_up 3
-  printf "\033[2K"
-  local status_line="${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}准备中...${C_RESET}"
+  _clr_line
+  local status_line="${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}准备下载...${C_RESET}"
   local stripped_status="${status_line//$'\033'[0-9;]*[a-zA-Z]/}"
   local pad=$(( $(_get_terminal_width) - 2 - ${#stripped_status} ))
   (( pad < 1 )) && pad=1
   echo "${C_BORDER}${B_V}${C_RESET} ${status_line}${C_BORDER}$(printf "%${pad}s" " ")${B_V}${C_RESET}"
-  printf "\033[2K"
-  _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
-  printf "\033[2K"
+  _clr_line
+  _progress_bar 0 0 "$(( current_idx - 1 ))" "$num_selected"
+  _clr_line
   _sub_progress_bar 0 0 "等待下载..." 0
 
-  pkg_start=$(date +%s)
+  _run_fetch "$name" "$type" "$idx"
+  local fetch_rc=$?
+
+  if (( fetch_rc == 0 )); then
+    dl_ok_names+=("$name")
+    dl_ok_types+=("$type")
+    dl_ok_sizes+=("$pkg_size")
+    dl_done=$(( dl_done + 1 ))
+    _cursor_up 3
+    _clr_line
+    local ok_line="${C_SUCCESS}✓${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_SUCCESS}已下载${C_RESET}"
+    local ok_stripped="${ok_line//$'\033'[0-9;]*[a-zA-Z]/}"
+    local ok_pad=$(( $(_get_terminal_width) - 2 - ${#ok_stripped} ))
+    (( ok_pad < 1 )) && ok_pad=1
+    echo "${C_BORDER}${B_V}${C_RESET} ${ok_line}${C_BORDER}$(printf "%${ok_pad}s" " ")${B_V}${C_RESET}"
+    _clr_line
+    _progress_bar 0 0 "$dl_done" "$num_selected"
+    _clr_line
+    _sub_progress_bar "$pkg_size" "$pkg_size" "已下载" 0
+  else
+    dl_fail_names+=("$name")
+    if (( fetch_rc == 2 )); then
+      dl_fail_reasons+=("下载超时")
+    else
+      dl_fail_reasons+=("下载失败")
+    fi
+    _cursor_up 3
+    _clr_line
+    local fail_line="${C_ERROR}✗${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_ERROR}${dl_fail_reasons[-1]}${C_RESET}"
+    local fail_stripped="${fail_line//$'\033'[0-9;]*[a-zA-Z]/}"
+    local fail_pad=$(( $(_get_terminal_width) - 2 - ${#fail_stripped} ))
+    (( fail_pad < 1 )) && fail_pad=1
+    echo "${C_BORDER}${B_V}${C_RESET} ${fail_line}${C_BORDER}$(printf "%${fail_pad}s" " ")${B_V}${C_RESET}"
+    _clr_line
+    _progress_bar 0 0 "$dl_done" "$num_selected"
+    _clr_line
+    _sub_progress_bar 0 0 "下载失败" 0
+  fi
+done
+
+# 阶段 1 汇总帧
+_cursor_up 3
+_clr_line
+local dl_summary="${C_INFO}📥 下载完成：${C_SUCCESS}${#dl_ok_names[@]} 个成功${C_RESET} ${C_ERROR}/${#dl_fail_names[@]} 个失败${C_RESET} ${C_MUTED}· 进入安装阶段${C_RESET}"
+local dl_s="${dl_summary//$'\033'[0-9;]*[a-zA-Z]/}"
+local dl_p=$(( $(_get_terminal_width) - 2 - ${#dl_s} ))
+(( dl_p < 1 )) && dl_p=1
+echo "${C_BORDER}${B_V}${C_RESET} ${dl_summary}${C_BORDER}$(printf "%${dl_p}s" " ")${B_V}${C_RESET}"
+_clr_line
+_progress_bar 0 0 "$dl_done" "$num_selected"
+_clr_line
+_sub_progress_bar 0 0 "阶段 1 完成" 0
+
+# ========== 阶段 2：逐个安装（只装下载成功的） ==========
+success_count=0
+fail_count=0
+failed_names=()
+success_names=()
+pkg_times=()
+completed_size=0
+current_idx=0
+install_total=${#dl_ok_names[@]}
+install_done=0
+
+for (( i=1; i<=install_total; i++ )); do
+  ((current_idx++))
+
+  name=${dl_ok_names[$i]}
+  type=${dl_ok_types[$i]}
+  pkg_size=${dl_ok_sizes[$i]}
+  type_color=$([[ "$type" == "cask" ]] && echo "$C_CASK" || echo "$C_FORMULA")
+  type_icon=$([[ "$type" == "cask" ]] && echo "📱" || echo "🍺")
+  local size_display=""
+  if (( pkg_size > 0 )); then
+    size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
+  else
+    size_display=" ${C_MUTED}· ?${C_RESET}"
+  fi
+
   local log_file="$TMP_BASE/$name.log"
 
-  local phase="下载中"
-  local fetch_done=0
-  local install_done=0
+  _cursor_up 3
+  _clr_line
+  local status_line="${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}安装中...${C_RESET}"
+  local stripped_status="${status_line//$'\033'[0-9;]*[a-zA-Z]/}"
+  local pad=$(( $(_get_terminal_width) - 2 - ${#stripped_status} ))
+  (( pad < 1 )) && pad=1
+  echo "${C_BORDER}${B_V}${C_RESET} ${status_line}${C_BORDER}$(printf "%${pad}s" " ")${B_V}${C_RESET}"
+  _clr_line
+  _progress_bar 0 0 "$(( current_idx - 1 ))" "$install_total"
+  _clr_line
+  _sub_progress_bar 0 0 "等待安装..." 0
+
+  pkg_start=$(date +%s)
   local brew_pid=""
-
   if [[ "$type" == "cask" ]]; then
-    # 回到3行块顶，画下载界面（状态行 + 整体进度 + 子进度），后台运行 fetch
-    _cursor_up 3
-    printf "\033[2K"
-    local dl_init="${C_PRIMARY}⠋${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}下载中...${C_RESET}"
-    local dl_init_s="${dl_init//$'\033'[0-9;]*[a-zA-Z]/}"
-    local dl_init_p=$(( $(_get_terminal_width) - 2 - ${#dl_init_s} ))
-    (( dl_init_p < 1 )) && dl_init_p=1
-    echo "${C_BORDER}${B_V}${C_RESET} ${dl_init}${C_BORDER}$(printf "%${dl_init_p}s" " ")${B_V}${C_RESET}"
-    _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
-    _sub_progress_bar 0 0 "下载中..." 0
-
-    # 后台 fetch：script 伪终端 + HOMEBREW_VERBOSE=1 保证在 TTY 语义下下载（不静默）
-    # （注意：Homebrew 6.x 不接受 "brew --verbose fetch"，须用环境变量方式传全局选项）
-    /usr/bin/script -e -q /dev/null env HOMEBREW_VERBOSE=1 brew fetch --cask "$name" > "$log_file" 2>&1 &
-    local fetch_pid=$!
-
-    # 下载轮询：解析日志 "Downloading X/Y" 计算实时速度，重画 3 行界面
-    spin_idx=0
-    local downloaded=0
-    local speed_bytes=0
-    local prev_bytes=0
-    local prev_ms=$(( EPOCHREALTIME * 1000 ))
-    while kill -0 "$fetch_pid" 2>/dev/null; do
-      local dl_line=""
-      [[ -f "$log_file" ]] && dl_line=$(grep -oE 'Downloading[[:space:]]+[0-9.]+ ?[kKMGT]?i?B?[[:space:]]*/[[:space:]]*[0-9.]+ ?[kKMGT]?i?B?' "$log_file" 2>/dev/null | tail -1)
-      if [[ -n "$dl_line" ]]; then
-        local dl_cur=$(echo "$dl_line" | grep -oE '[0-9.]+ ?[kKMGT]?i?B?' | head -1)
-        local dl_tot=$(echo "$dl_line" | grep -oE '[0-9.]+ ?[kKMGT]?i?B?' | tail -1)
-        local tot_bytes=$(_parse_size "$dl_tot")
-        downloaded=$(_parse_size "$dl_cur")
-        if (( pkg_size <= 0 && tot_bytes > 0 )); then
-          pkg_size=$tot_bytes
-          size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
-          total_size=$(( total_size - pkg_sizes[idx] + pkg_size ))
-          pkg_sizes[$idx]=$pkg_size
-        fi
-      fi
-      local now_ms=$(( EPOCHREALTIME * 1000 ))
-      local dt_ms=$(( now_ms - prev_ms ))
-      if (( dt_ms >= 200 )); then
-        local delta=$(( downloaded - prev_bytes ))
-        (( delta < 0 )) && delta=0
-        speed_bytes=$(( int(delta * 1000.0 / dt_ms) ))
-        prev_bytes=$downloaded
-        prev_ms=$now_ms
-      fi
-      local spin_count=${#SPIN_FRAMES[@]}
-      local spin_pos=$(( spin_idx % spin_count ))
-      local spin_char="$SPIN_FRAMES[$spin_pos]"
-      local speed_display=""
-      (( speed_bytes > 0 )) && speed_display=" ${C_ACCENT}$(_fmt_speed $speed_bytes)${C_RESET}"
-      _cursor_up 3
-      printf "\033[2K"
-      local dl_status="${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}下载中${C_RESET}${speed_display}"
-      local dl_stripped="${dl_status//$'\033'[0-9;]*[a-zA-Z]/}"
-      local dl_pad=$(( $(_get_terminal_width) - 2 - ${#dl_stripped} ))
-      (( dl_pad < 1 )) && dl_pad=1
-      echo "${C_BORDER}${B_V}${C_RESET} ${dl_status}${C_BORDER}$(printf "%${dl_pad}s" " ")${B_V}${C_RESET}"
-      printf "\033[2K"
-      _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
-      printf "\033[2K"
-      _sub_progress_bar "$downloaded" "$pkg_size" "下载中" "$spin_idx"
-      spin_idx=$(( spin_idx + 1 ))
-      sleep 0.1
-    done
-
-    wait "$fetch_pid"
-    local fetch_exit=$?
-    fetch_done=1
-
-    if (( fetch_exit == 0 )); then
-      # 兜底：若下载期间未解析到包大小，从日志最后一行解析
-      if (( pkg_size <= 0 )); then
-        local size_str=$(tr -d '\r' < "$log_file" | grep -oE '[0-9.]+ ?[kKMGT]i?B?' | head -1)
-        if [[ -n "$size_str" ]]; then
-          pkg_size=$(_parse_size "$size_str")
-          if (( pkg_size > 0 )); then
-            size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
-            total_size=$(( total_size - pkg_sizes[idx] + pkg_size ))
-            pkg_sizes[$idx]=$pkg_size
-          fi
-        fi
-      fi
-      # 输出3行安装界面，进入安装阶段
-      phase="安装中"
-      brew reinstall --cask "$name" > "$log_file" 2>&1 &
-      brew_pid=$!
-      local pkg_status_line="${C_PRIMARY}⠋${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}${phase}...${C_RESET}"
-      local stripped_status="${pkg_status_line//$'\033'[0-9;]*[a-zA-Z]/}"
-      local pad=$(( $(_get_terminal_width) - 2 - ${#stripped_status} ))
-      (( pad < 1 )) && pad=1
-      echo "${C_BORDER}${B_V}${C_RESET} ${pkg_status_line}${C_BORDER}$(printf "%${pad}s" " ")${B_V}${C_RESET}"
-      _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
-      _sub_progress_bar "$pkg_size" "$pkg_size" "$phase" 0
-    else
-      install_done=1
-      brew_exit=$fetch_exit
-      # 失败也恒定输出3行，与成功路径行数一致
-      local fail_status="${C_ERROR}✗${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_ERROR}下载失败${C_RESET}"
-      local fail_stripped="${fail_status//$'\033'[0-9;]*[a-zA-Z]/}"
-      local fail_pad=$(( $(_get_terminal_width) - 2 - ${#fail_stripped} ))
-      (( fail_pad < 1 )) && fail_pad=1
-      echo "${C_BORDER}${B_V}${C_RESET} ${fail_status}${C_BORDER}$(printf "%${fail_pad}s" " ")${B_V}${C_RESET}"
-      _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
-      _sub_progress_bar 0 0 "下载失败" 0
-    fi
+    brew reinstall --cask "$name" > "$log_file" 2>&1 &
   else
-    # formula - 直接后台升级
     brew upgrade --formula "$name" > "$log_file" 2>&1 &
-    brew_pid=$!
-    fetch_done=1
   fi
+  brew_pid=$!
 
-  # 安装阶段的界面更新循环（仅在有后台进程时进入）
+  # 安装轮询（3 行界面）
   spin_idx=0
-  local downloaded=0
+  local downloaded=$pkg_size
   local log_offset=0
-  if [[ "$type" == "cask" && "$fetch_done" == "1" ]]; then
-    downloaded=$pkg_size
-  fi
-
+  local phase="安装中"
   while [[ -n "$brew_pid" ]] && kill -0 "$brew_pid" 2>/dev/null; do
     _cursor_up 3
-    printf "\033[2K"
-
+    _clr_line
     local log_content=""
     if [[ -f "$log_file" ]]; then
       log_content=$(tail -c +$(( log_offset + 1 )) "$log_file" 2>/dev/null)
       local new_bytes=${#log_content}
       log_offset=$(( log_offset + new_bytes ))
     fi
-
-    if (( pkg_size > 0 && downloaded >= pkg_size )); then
-      phase="安装中"
-    else
-      phase="处理中"
-    fi
-
     local spin_count=${#SPIN_FRAMES[@]}
-    local spin_pos=$(( spin_idx % spin_count ))
+    local spin_pos=$(( (spin_idx % spin_count) + 1 ))
     local spin_char="$SPIN_FRAMES[$spin_pos]"
-
-    local current_total_progress=$(( completed_size + downloaded ))
-    (( current_total_progress > total_size )) && current_total_progress=$total_size
-
     local pkg_status_line="${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}${phase}...${C_RESET}"
     local stripped_status="${pkg_status_line//$'\033'[0-9;]*[a-zA-Z]/}"
     local pad=$(( $(_get_terminal_width) - 2 - ${#stripped_status} ))
     (( pad < 1 )) && pad=1
     echo "${C_BORDER}${B_V}${C_RESET} ${pkg_status_line}${C_BORDER}$(printf "%${pad}s" " ")${B_V}${C_RESET}"
-
-    printf "\033[2K"
-    _progress_bar "$current_total_progress" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
-
-    printf "\033[2K"
+    _clr_line
+    _progress_bar 0 0 "$(( current_idx - 1 ))" "$install_total"
+    _clr_line
     local sub_current=$downloaded
     local sub_total=$pkg_size
     if (( pkg_size <= 0 )); then
       sub_current=0
       sub_total=0
     fi
-    if (( downloaded > pkg_size && pkg_size > 0 )); then
-      sub_current=$pkg_size
-    fi
     _sub_progress_bar "$sub_current" "$sub_total" "$phase" "$spin_idx"
-
     spin_idx=$(( spin_idx + 1 ))
     sleep 0.1
   done
 
-  if [[ -n "$brew_pid" ]]; then
-    wait "$brew_pid"
-    brew_exit=$?
-  fi
+  wait "$brew_pid"
+  local brew_exit=$?
 
   pkg_end=$(date +%s)
   pkg_dur=$(( pkg_end - pkg_start ))
   pkg_times+=("$pkg_dur")
 
   _cursor_up 3
-  printf "\033[2K"
+  _clr_line
   if (( brew_exit == 0 )); then
     success_count=$(( success_count + 1 ))
     success_names+=("$name")
     completed_size=$(( completed_size + pkg_size ))
     (( completed_size > total_size )) && completed_size=$total_size
+    install_done=$(( install_done + 1 ))
     echo "${C_BORDER}${B_V}${C_RESET} ${C_SUCCESS}✓${C_RESET} ${type_color}${name}${C_RESET} ${C_MUTED}升级完成 · $(_fmt_duration $pkg_dur)${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
   else
     fail_count=$(( fail_count + 1 ))
     failed_names+=("$name")
     completed_size=$(( completed_size + pkg_size ))
     (( completed_size > total_size )) && completed_size=$total_size
+    install_done=$(( install_done + 1 ))
     echo "${C_BORDER}${B_V}${C_RESET} ${C_ERROR}✗${C_RESET} ${type_color}${name}${C_RESET} ${C_ERROR}升级失败${C_RESET} ${C_MUTED}· $(_fmt_duration $pkg_dur)${C_RESET} ${C_BORDER}${B_V}${C_RESET}"
   fi
 
-  printf "\033[2K"
-  _progress_bar "$completed_size" "$total_size" "$current_idx" "$num_selected"
+  _clr_line
+  _progress_bar 0 0 "$install_done" "$install_total"
 
-  printf "\033[2K"
-  local next_msg=$([[ $current_idx -lt $num_selected ]] && echo "下一个准备中..." || echo "全部完成")
+  _clr_line
+  local next_msg=$([[ $current_idx -lt $install_total ]] && echo "下一个准备中..." || echo "全部完成")
   local stripped_next="${next_msg//$'\033'[0-9;]*[a-zA-Z]/}"
   local next_pad=$(( $(_get_terminal_width) - 2 - ${#stripped_next} - 2 ))
   (( next_pad < 1 )) && next_pad=1
   echo "${C_BORDER}${B_V}${C_RESET} ${C_MUTED}${next_msg}${C_RESET}${C_BORDER}$(printf "%${next_pad}s" " ")${B_V}${C_RESET}"
+done
+
+# 下载失败/超时的包并入失败统计
+for (( f=1; f<=${#dl_fail_names[@]}; f++ )); do
+  fail_count=$(( fail_count + 1 ))
+  failed_names+=("${dl_fail_names[$f]}")
+  pkg_times+=("0")
 done
 
 _show_cursor
@@ -1279,6 +1436,12 @@ if (( clean_logs == 1 )); then
   else
     echo "${C_MUTED}  - 无临时日志${C_RESET}"
   fi
+fi
+
+# ---- 版本自检（静默失败，不打扰；brew outdated 已提示则跳过）----
+LATEST_TAG=""
+if (( self_update_available == 0 )); then
+  LATEST_TAG=$(curl -fsSL --max-time 3 "https://api.github.com/repos/yingshu0218/homebrew-update-all/releases/latest" 2>/dev/null | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | sed 's/.*"v//; s/"//')
 fi
 
 # ---- 统计摘要 ----
@@ -1330,6 +1493,16 @@ fi
 
 _draw_bottom_border
 echo ""
+
+# 新版本提示（仅当 GitHub 最新 tag 确实比本地版本新）
+if [[ -n "$LATEST_TAG" && "$LATEST_TAG" != "$BREW_UA_VERSION" && "$(printf '%s\n%s' "$BREW_UA_VERSION" "$LATEST_TAG" | sort -V | tail -1)" == "$LATEST_TAG" ]]; then
+  echo "${C_WARN}  ⚡ 发现新版本 v${LATEST_TAG}（当前 v${BREW_UA_VERSION}）${C_RESET}"
+  echo "${C_MUTED}     升级: brew upgrade brew-update-all${C_RESET}"
+  echo ""
+fi
+
+# 释放单实例锁
+rm -f "$LOCK_FILE"
 
 if (( fail_count > 0 )); then
   echo "${C_WARN}  ⚠  有 ${fail_count} 个包升级失败，可查看上方日志排查问题${C_RESET}"

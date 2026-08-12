@@ -1,112 +1,115 @@
 # brew-update-all
 
-逐个升级 Homebrew formula 和 cask，支持交互选择和自动模式。
-避免因网络问题导致批量升级失败，一个包出错不影响其他包。
+Upgrade Homebrew formulae and casks one by one, with interactive and auto modes.
+A failed package never blocks the others — no more "one stuck download kills the whole batch".
 
-## 安装
+## Install
 
 ```bash
 brew tap yingshu0218/update-all
 brew install brew-update-all
 ```
 
-## 使用
+## Usage
 
 ```bash
-# 交互模式 – 输入序号选择要更新的包
+# Interactive mode – pick packages by number
 brew ua
 
-# 自动模式 – 不提示，全部更新
+# Auto mode – upgrade everything without prompting
 brew ua auto
 
-# 只升级 formula
+# Formulae only / casks only
 brew ua formula
-
-# 只升级 cask
 brew ua cask
 
-# 包含自动更新应用 – 默认跳过 Chrome/VS Code 等自带更新的 cask
+# Include self-updating apps (Chrome/VS Code etc. are skipped by default)
 brew ua -a
 brew ua auto -a
-brew ua formula -a
-brew ua cask -a
 
-# 升级后深度清理下载缓存
+# Deep-clean download cache / clean this run's temp logs after upgrading
 brew ua auto --prune
-
-# 升级后清理本次产生的临时日志
 brew ua auto --clean-logs
 
-# 环境诊断（网络 / Tap 源 / 本地配置）
+# Environment diagnostics (network / tap sources / local config)
 brew ua ck
 
-# 屏蔽某个 cask（不参与更新），解除屏蔽，查看屏蔽列表
+# Ignore a cask, un-ignore it, list ignored casks
 brew ua ig firefox
 brew ua uig firefox
 brew ua igl
 ```
 
-| 模式 / 选项 | 说明 |
+| Mode / option | Description |
 |------|------|
-| *(空)* | 交互模式，输入序号选择要升级的包 |
-| `auto` | 自动模式，跳过交互直接升级全部 |
-| `formula` | 只升级 formula（交互模式） |
-| `cask` | 只升级 cask（交互模式） |
-| `-a` | 扫描所有 cask，包含自带自动更新的应用（Chrome、VS Code、Edge 等） |
-| `--prune` | 升级后深度清理下载缓存（`brew cleanup --prune=all`） |
-| `--clean-logs` | 升级后清理本次产生的临时日志文件 |
-| `ck` / `check` | 环境诊断：网络、Tap 源、本地配置检测 |
-| `ig` / `ignore <cask>` | 屏蔽指定 cask，不再出现在更新列表 |
-| `uig` / `unignore <cask>` | 解除屏蔽 |
-| `igl` / `ignored` | 查看当前屏蔽列表 |
+| *(none)* | Interactive mode, enter numbers to pick packages |
+| `auto` | Auto mode, upgrade everything |
+| `formula` | Formulae only (interactive) |
+| `cask` | Casks only (interactive) |
+| `-a` | Include self-updating casks (Chrome, VS Code, Edge, …) |
+| `--prune` | Deep clean download cache after upgrading (`brew cleanup --prune=all`) |
+| `--clean-logs` | Clean this run's temp log directory |
+| `ck` / `check` | Diagnostics: network, tap sources, local config |
+| `ig` / `ignore <cask>` | Ignore a cask so it never appears in the update list |
+| `uig` / `unignore <cask>` | Un-ignore a cask |
+| `igl` / `ignored` | List ignored casks |
 
-> **提示**：不加 `-a` 时，Homebrew 默认跳过 `auto_updates true` 的应用，因为它们会自己后台更新。如果你希望精确控制所有包的版本，加上 `-a`。
+> **Note**: without `-a`, Homebrew skips casks with `auto_updates true` (they update themselves). Add `-a` if you want to pin every app version.
 
-## 功能特性
+## Features
 
-- 🎨 **彩色界面** – 清晰的颜色区分和精致边框排版
-- 📊 **进度条** – 实时显示整体升级进度和百分比
-- ⏱️ **耗时统计** – 每个包的升级耗时和总耗时
-- 📋 **统计摘要** – 升级完成后展示成功/失败数量和详细列表
-- 🎯 **分类升级** – 支持只升级 formula 或只升级 cask
-- 🚫 **屏蔽列表** – 可屏蔽指定 cask，升级时自动跳过
-- 🔍 **日志记录** – 失败的包自动保存日志到独立临时目录（`/tmp/brew-ua.XXXXXX`）
-- 📦 **包大小显示** – 下载后自动解析并显示每个包的大小
-- ⚡ **下载速度** – cask 下载时实时显示下载进度与 MB/s 速度
-- 🌀 **加载动画** – 升级过程中的 spinner 动画，实时反馈运行状态
-- 🧹 **清理选项** – 支持深度清理下载缓存和临时日志
+- 🎨 **Colored UI** – clear color coding and polished borders
+- 📊 **Progress bars** – overall progress with percentage
+- ⏱️ **Timing stats** – per-package and total duration
+- 📋 **Summary report** – success/failure counts and detail lists
+- 🎯 **Category filter** – formulae-only or casks-only
+- 🚫 **Ignore list** – skip specific casks
+- 🔍 **Logging** – failed packages keep logs in a private temp dir (`$TMPDIR/brew-ua.XXXXXX`)
+- 📦 **Package size** – parsed after download and shown inline
+- ⚡ **Download speed** – live MB/s for both casks and formulae
+- 🌀 **Spinner animations** – live feedback while working
+- 🧹 **Cleanup options** – deep cache prune and temp log cleanup
 
-## 脚本流程
+## How it works
 
-1. **brew update** – 更新源和包信息
-2. **列出可更新包** – formula 和 cask 分类展示在带边框的面板中
-3. **逐个升级** – 每个包独立下载→安装，带进度条、spinner 动画、包大小和速度显示，失败继续下一个
-4. **brew cleanup** – 清理旧版本
-5. **可选清理** – 深度清理缓存 / 清理临时日志（需加选项）
-6. **统计摘要** – 展示总耗时、成功率、成功/失败包列表
+1. **brew update** – refresh taps and package info
+2. **List outdated packages** – formulae and casks in a bordered panel
+3. **Stage 1: download all** – fetch each package with live progress/speed, a per-package timeout (default 10 min), and failure isolation; a stuck download is killed and skipped, the rest continue
+4. **Stage 2: install all** – install only the successfully downloaded packages (casks via `brew reinstall`, formulae via `brew upgrade`)
+5. **brew cleanup** – remove old versions
+6. **Summary** – total time, success rate, success/failure lists
 
-## 最近更新
+## Changelog
+
+### v1.8.5 (2026-08-13)
+
+- 🏗️ **Two-phase upgrade** – download every package first (with live speed, per-package timeout and failure isolation), then install the ones that downloaded OK. A single stuck download can no longer stall anything else
+- ⚡ **Formula download speed** – formulae now show the same live MB/s progress as casks
+- 🖥️ **Non-TTY output** – clean plain-text output when piped/redirected (no ANSI noise)
+- 🧪 **Test suite + CI** – smoke tests (`scripts/test.sh`) covering speed, sizing, two-phase order, timeout, failure isolation and non-TTY; CI runs syntax check, tests and `brew audit`
+- 🔒 **Strict mode & single-instance lock** – undefined-variable errors surface early; a second `brew ua` refuses to run
+- 📢 **Version self-check** – notifies when a new release is available
 
 ### v1.8.4 (2026-08-13)
 
-- 🐛 **修复 brew 6.x 兼容**：`brew --verbose fetch` 在 Homebrew 6.x 报 "Unknown command"，导致 cask 全部失败；改用环境变量 `HOMEBREW_VERBOSE=1` 传递全局选项
-- ⚡ **下载速度**：自研解析 brew 下载进度（`Downloading X/Y`），在状态行实时显示 MB/s 速度与下载进度条
-- 🤖 **发布自动化**：打 `v*` tag 时自动下载 tarball 计算 sha256 并更新 Formula，不再手动发版
+- 🐛 **Homebrew 6.x compatibility** – `brew --verbose fetch` broke on Homebrew 6.x ("Unknown command"); now uses the `HOMEBREW_VERBOSE=1` env var
+- ⚡ **Download speed** – parses brew's `Downloading X/Y` frames into live MB/s
+- 🤖 **Auto release** – pushing a `v*` tag downloads the tarball, computes sha256 and bumps the Formula automatically
 
 ### v1.8.3 (2026-08-12)
 
-- 🐛 **修复下载失败被误判为成功**：fetch 退出码取错管道位置（恒取到 tee 的 0），已改取 brew 实际退出码
-- 🐛 **修复升级界面内容残留**：下载/安装阶段行数错位导致界面重叠，改用保存光标 + 清屏后统一重画
-- 🐛 **修复包大小始终显示 `?`**：支持 curl 的 `20.0M` / `121k` 大小格式
-- 🛡️ **临时日志安全加固**：日志从 `/tmp` 固定文件名改为独立临时目录
+- 🐛 **Failed download no longer reported as success** – fetch exit code was taken from the wrong pipe slot (always `tee`'s 0)
+- 🐛 **UI artifacts fixed** – download/install row accounting unified via cursor-save + clear
+- 🐛 **Package size always `?` fixed** – supports `20.0M` / `121k` formats
+- 🛡️ **Temp logs hardened** – moved from fixed `/tmp` filenames to a private temp dir
 
-## 卸载
+## Uninstall
 
 ```bash
 brew uninstall brew-update-all
 brew untap yingshu0218/update-all
 ```
 
-## 许可证
+## License
 
 MIT
