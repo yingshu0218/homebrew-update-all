@@ -1,0 +1,45 @@
+name: Auto-bump Formula on tag
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bump formula url and sha256
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          REPO="${GITHUB_REPOSITORY}"
+          FORMULA="Formula/brew-update-all.rb"
+
+          # 从 GitHub 下载 tag tarball 并计算 sha256（动态生成，勿用本地 archive）
+          URL="https://github.com/${REPO}/archive/refs/tags/${TAG}.tar.gz"
+          SHA=$(curl -fsSL "${URL}" | shasum -a 256 | awk '{print $1}')
+          echo "tag=${TAG} sha256=${SHA}"
+
+          # 幂等：Formula 已指向该版本则跳过
+          if grep -q "${TAG}.tar.gz" "$FORMULA" && grep -q "${SHA}" "$FORMULA"; then
+            echo "Formula 已是最新，无需更新"
+            exit 0
+          fi
+
+          # 更新 url 与 sha256
+          sed -i "s|url \".*\"|url \"${URL}\"|" "$FORMULA"
+          sed -i "s|sha256 \"[0-9a-f]*\"|sha256 \"${SHA}\"|" "$FORMULA"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$FORMULA"
+          git commit -m "Bump version to ${TAG}" || echo "无改动"
+          git push origin HEAD:main
