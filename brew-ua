@@ -721,12 +721,16 @@ done
 
 # ---------- 主流程 ----------
 
+# 独立临时日志目录（避免 /tmp 固定文件名冲突与符号链接风险）
+TMP_BASE=$(mktemp -d "${TMPDIR:-/tmp}/brew-ua.XXXXXX" 2>/dev/null)
+[[ -z "$TMP_BASE" || ! -d "$TMP_BASE" ]] && TMP_BASE="/tmp"
+
 total_start=$(date +%s)
 
 # ---- brew update ----
 _section_title "🔄" "更新 Homebrew 源"
 
-update_log="/tmp/brew-ua-update.log"
+update_log="$TMP_BASE/update.log"
 brew update > "$update_log" 2>&1 &
 update_pid=$!
 
@@ -1029,7 +1033,7 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   _sub_progress_bar 0 0 "等待下载..." 0
 
   pkg_start=$(date +%s)
-  local log_file="/tmp/brew-ua-$name.log"
+  local log_file="$TMP_BASE/$name.log"
 
   local phase="下载中"
   local fetch_done=0
@@ -1208,12 +1212,13 @@ fi
 if (( clean_logs == 1 )); then
   echo ""
   echo "${C_INFO}  ℹ 清理本次产生的临时日志...${C_RESET}"
-  local cleaned=0
-  local all_names=("${success_names[@]}" "${failed_names[@]}")
-  for n in $all_names; do
-    [[ -f "/tmp/brew-ua-$n.log" ]] && rm -f "/tmp/brew-ua-$n.log" && cleaned=$(( cleaned + 1 ))
-  done
-  echo "${C_SUCCESS}  ✓ 已清理 ${cleaned} 个日志文件${C_RESET}"
+  if [[ -d "$TMP_BASE" ]]; then
+    local log_count=$(find "$TMP_BASE" -type f 2>/dev/null | wc -l | tr -d ' ')
+    rm -rf "$TMP_BASE"
+    echo "${C_SUCCESS}  ✓ 已清理临时日志目录（${log_count} 个文件）${C_RESET}"
+  else
+    echo "${C_MUTED}  - 无临时日志${C_RESET}"
+  fi
 fi
 
 # ---- 统计摘要 ----
@@ -1235,7 +1240,7 @@ if (( fail_count > 0 )); then
   _line_left "  ${C_ERROR}${C_BOLD}失败的包:${C_RESET}"
   local fn
   for fn in $failed_names; do
-    _line_left "     ${C_ERROR}• ${fn}${C_RESET}  ${C_MUTED}日志: /tmp/brew-ua-${fn}.log${C_RESET}"
+    _line_left "     ${C_ERROR}• ${fn}${C_RESET}  ${C_MUTED}日志: ${TMP_BASE}/${fn}.log${C_RESET}"
   done
 fi
 
