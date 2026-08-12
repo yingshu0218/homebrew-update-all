@@ -100,12 +100,13 @@ function _fmt_size() {
 function _parse_size() {
   local size_str=$1
   local num=$(echo "$size_str" | grep -oE '[0-9.]+')
-  local unit=$(echo "$size_str" | grep -oE '[KMG]B')
+  local unit=$(echo "$size_str" | grep -oE '[kKMGT]i?B?$')
   local bytes=0
   case "$unit" in
-    KB) bytes=$(awk "BEGIN {printf \"%.0f\", $num * 1024}") ;;
-    MB) bytes=$(awk "BEGIN {printf \"%.0f\", $num * 1048576}") ;;
-    GB) bytes=$(awk "BEGIN {printf \"%.0f\", $num * 1073741824}") ;;
+    k|K|KB|KiB|kB) bytes=$(awk "BEGIN {printf \"%.0f\", $num * 1024}") ;;
+    m|M|MB|MiB) bytes=$(awk "BEGIN {printf \"%.0f\", $num * 1048576}") ;;
+    g|G|GB|GiB) bytes=$(awk "BEGIN {printf \"%.0f\", $num * 1073741824}") ;;
+    t|T|TB|TiB) bytes=$(awk "BEGIN {printf \"%.0f\", $num * 1099511627776}") ;;
     *) bytes=$(printf "%.0f" "$num") ;;
   esac
   echo "$bytes"
@@ -1036,22 +1037,25 @@ for (( idx=1; idx<=num_selected; idx++ )); do
   local brew_pid=""
 
   if [[ "$type" == "cask" ]]; then
-    # 清理3行界面，让brew原生下载进度（含速度）直接显示
+    # 回到3行块顶并清行，存光标后画1行下载状态行
     _cursor_up 3
     printf "\033[2K"
+    printf "\033[s"
     local dl_status="${C_PRIMARY}⠋${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}下载中...${C_RESET}"
     local dl_stripped="${dl_status//$'\033'[0-9;]*[a-zA-Z]/}"
     local dl_pad=$(( $(_get_terminal_width) - 2 - ${#dl_stripped} ))
     (( dl_pad < 1 )) && dl_pad=1
     echo "${C_BORDER}${B_V}${C_RESET} ${dl_status}${C_BORDER}$(printf "%${dl_pad}s" " ")${B_V}${C_RESET}"
-    # brew fetch 前台运行，原生进度条（含下载速度）直接输出到终端
-    brew fetch --cask "$name" 2>&1 | tee "$log_file" >/dev/null
-    local fetch_exit=${pipestatus[2]:-$pipestatus[1]}
+    # script 伪终端 + --verbose：curl 恢复原生仪表（含下载速度），前台运行直接上屏
+    /usr/bin/script -e -q /dev/null brew --verbose fetch --cask "$name" 2>&1 | tee "$log_file"
+    local fetch_exit=$pipestatus[1]
     fetch_done=1
 
+    # 恢复光标到块顶并清屏到底部，清掉状态行与 fetch 输出，统一重画 3 行
+    printf "\033[u\033[J"
     if (( fetch_exit == 0 )); then
-      # 从日志获取包大小
-      local size_str=$(grep -oE '[0-9.]+ ?[KMG]B' "$log_file" | tail -1)
+      # 从日志获取包大小（tr -d '\r' 去除 curl 刷新符，head -1 取 Total 列）
+      local size_str=$(tr -d '\r' < "$log_file" | grep -oE '[0-9.]+ ?[kKMGT]i?B?' | head -1)
       if [[ -n "$size_str" ]]; then
         pkg_size=$(_parse_size "$size_str")
         if (( pkg_size > 0 )); then
@@ -1060,11 +1064,10 @@ for (( idx=1; idx<=num_selected; idx++ )); do
           pkg_sizes[$idx]=$pkg_size
         fi
       fi
-      # 重新输出3行界面，进入安装阶段
+      # 输出3行安装界面，进入安装阶段
       phase="安装中"
       brew reinstall --cask "$name" > "$log_file" 2>&1 &
       brew_pid=$!
-      # 输出3行初始界面，供while循环覆盖
       local pkg_status_line="${C_PRIMARY}⠋${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}${phase}...${C_RESET}"
       local stripped_status="${pkg_status_line//$'\033'[0-9;]*[a-zA-Z]/}"
       local pad=$(( $(_get_terminal_width) - 2 - ${#stripped_status} ))
@@ -1075,7 +1078,12 @@ for (( idx=1; idx<=num_selected; idx++ )); do
     else
       install_done=1
       brew_exit=$fetch_exit
-      # 补充2行输出，确保后续_cursor_up 3能正确对齐
+      # 失败也恒定输出3行，与成功路径行数一致
+      local fail_status="${C_ERROR}✗${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_ERROR}下载失败${C_RESET}"
+      local fail_stripped="${fail_status//$'\033'[0-9;]*[a-zA-Z]/}"
+      local fail_pad=$(( $(_get_terminal_width) - 2 - ${#fail_stripped} ))
+      (( fail_pad < 1 )) && fail_pad=1
+      echo "${C_BORDER}${B_V}${C_RESET} ${fail_status}${C_BORDER}$(printf "%${fail_pad}s" " ")${B_V}${C_RESET}"
       _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
       _sub_progress_bar 0 0 "下载失败" 0
     fi

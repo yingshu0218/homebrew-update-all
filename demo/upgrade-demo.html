@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>brew ua — cask 下载速度修复前后对比</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0f1115; color: #d8dee9;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding: 28px 20px 40px;
+  }
+  h1 { font-size: 19px; font-weight: 600; letter-spacing: .5px; }
+  .sub { color: #7b8494; font-size: 13px; margin: 6px 0 22px; }
+  .controls { display: flex; gap: 10px; margin-bottom: 18px; }
+  .controls button {
+    background: #1e2430; color: #d8dee9; border: 1px solid #2f3746;
+    padding: 7px 18px; border-radius: 8px; font-size: 13px; cursor: pointer;
+    transition: background .15s;
+  }
+  .controls button:hover { background: #2a3242; }
+  .controls button:disabled { opacity: .4; cursor: not-allowed; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: #161a21; border: 1px solid #242b38; border-radius: 12px; overflow: hidden;
+  }
+  .card-head {
+    display: flex; align-items: center; gap: 8px; padding: 9px 14px;
+    background: #1b212c; border-bottom: 1px solid #242b38; font-size: 13px; color: #aab3c5;
+  }
+  .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .dot.r { background: #ff5f57; } .dot.y { background: #febc2e; } .dot.g { background: #28c840; }
+  .tag { margin-left: auto; font-size: 11px; padding: 2px 9px; border-radius: 20px; }
+  .tag.old { background: #3a2c16; color: #e6b45c; }
+  .tag.new { background: #16352a; color: #5ec89a; }
+  .term {
+    background: #0c0e13; padding: 12px 14px; min-height: 380px; max-height: 430px;
+    overflow-y: auto; font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px; line-height: 1.55; white-space: pre;
+  }
+  .term::-webkit-scrollbar { width: 6px; }
+  .term::-webkit-scrollbar-thumb { background: #2a3242; border-radius: 3px; }
+  .l { color: #aab3c5; }
+  .l.hl { color: #5fafff; }
+  .l.ok { color: #5ec89a; }
+  .l.curl { color: #c9d1d9; }
+  .l.curl.hdr { color: #7b8494; }
+  .l.border { color: #5c6472; }
+  .bar { color: #5fafff; }
+  .dim { color: #5c6472; }
+  .spinner { display: inline-block; width: 12px; }
+</style>
+</head>
+<body>
+<h1>brew ua — cask 下载速度 · 修复前后对比</h1>
+<div class="sub">同一台机器、同一个 cask（firefox 20.0M），修复前只有转圈，修复后显示 curl 原生下载仪表（含实时 MB/s 速度）</div>
+
+<div class="controls">
+  <button id="playBtn">▶ 播放对比</button>
+  <button id="resetBtn">↺ 重置</button>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <div class="card-head">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span style="margin-left:6px">v1.8.2 · 部署版（修复前）</span>
+      <span class="tag old">无下载速度</span>
+    </div>
+    <div class="term" id="termOld"></div>
+  </div>
+  <div class="card">
+    <div class="card-head">
+      <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+      <span style="margin-left:6px">v1.8.3 · 修复版</span>
+      <span class="tag new">原生进度条 + MB/s</span>
+    </div>
+    <div class="term" id="termNew"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+const SPIN = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+
+class Term {
+  constructor(id) {
+    this.el = document.getElementById(id);
+    this.rows = [];
+    this.idx = 0;
+  }
+  line(text, cls) {
+    const d = document.createElement("div");
+    d.className = "l " + (cls || "");
+    d.textContent = text;
+    this.el.appendChild(d);
+    this.rows.push(d);
+    this.idx = this.rows.length - 1;
+    this.scroll();
+    return d;
+  }
+  replace(n, text, cls) {
+    const r = this.rows[this.rows.length - 1 - n];
+    if (!r) return;
+    r.textContent = text;
+    if (cls) r.className = "l " + cls;
+  }
+  scroll() { this.el.scrollTop = this.el.scrollHeight; }
+  clear() {
+    this.el.innerHTML = "";
+    this.rows = [];
+    this.idx = 0;
+  }
+}
+
+const oldTerm = new Term("termOld");
+const newTerm = new Term("termNew");
+
+function barFilled(pct, len) {
+  const f = Math.round(len * pct / 100);
+  return "█".repeat(f) + "░".repeat(len - f);
+}
+
+function reset() {
+  oldTerm.clear(); newTerm.clear();
+  drawInitial();
+}
+
+function drawInitial() {
+  const B = (t) => t.line("│ " + t.txt, "border");
+  oldTerm.line("┌────── 🚀 升级进度 ──────┐", "border");
+  newTerm.line("┌────── 🚀 升级进度 ──────┐", "border");
+  const o = oldTerm.line("│ ⠋ 📱 firefox (cask) · ? 下载中... │", "hl");
+  const n = newTerm.line("│ ⠋ 📱 firefox (cask) · ? 下载中... │", "hl");
+  return { o, n };
+}
+
+let timer = null;
+let playing = false;
+let elapsed = 0;
+let lastTs = 0;
+let oldSpinRef = null, newSpinRef = null;
+let curlRef = null;
+let curlFrame = 0;
+
+function curlFrameText(pct) {
+  const total = 20.0, done = (total * pct / 100).toFixed(1);
+  const speed = (1.9 + Math.sin(curlFrame / 2) * 0.9 + pct * 0.012).toFixed(1);
+  const remain = pct >= 100 ? "--:--:--" : "0:00:0" + Math.max(1, Math.ceil((100 - pct) / 14));
+  const spent = "0:00:0" + Math.max(1, Math.ceil(pct / 14));
+  return `  ${String(pct).padStart(3)}  ${total}M  ${String(done).padStart(5)}M    0     0  ${String(speed).padStart(5)}M      0  ${remain}  ${spent}  ${remain}  ${speed}M`;
+}
+
+function play() {
+  if (playing) return;
+  playing = true;
+  document.getElementById("playBtn").textContent = "⏸ 暂停";
+  lastTs = performance.now();
+
+  oldSpinRef = oldTerm.line("│ ⠋ 📱 firefox (cask) · ? 下载中... │", "hl");
+  newSpinRef = newTerm.line("│ ⠋ 📱 firefox (cask) · ? 下载中... │", "hl");
+
+  const spinTick = setInterval(() => {
+    if (!playing) { clearInterval(spinTick); return; }
+    const s = SPIN[Math.floor((elapsed * 10) % SPIN.length)];
+    oldSpinRef.textContent = "│ " + s + " 📱 firefox (cask) · ? 下载中... │";
+    newSpinRef.textContent = "│ " + s + " 📱 firefox (cask) · ? 下载中... │";
+  }, 110);
+
+  // 修复版：1.0s 后出现 curl 原生仪表（含速度）
+  const curlStart = setTimeout(() => {
+    newTerm.line("  % Total    % Received % Xferd  Average Speed   Time    Time     Time  Current", "curl hdr");
+    newTerm.line("                                 Dload  Upload   Total   Spent    Left  Speed", "curl hdr");
+    curlRef = newTerm.line(curlFrameText(0), "curl");
+    const curlTick = setInterval(() => {
+      if (!playing) { clearInterval(curlTick); return; }
+      curlFrame++;
+      const pct = Math.min(100, Math.round((curlFrame / 55) * 100));
+      curlRef.textContent = curlFrameText(pct);
+      if (pct >= 100) {
+        clearInterval(curlTick);
+        newTerm.line("", "");
+      }
+    }, 130);
+  }, 1000);
+
+  // 修复版：下载结束后进入 3 行安装界面
+  const installT = setTimeout(() => {
+    newSpinRef.textContent = "│ ✓ 📱 firefox (cask) · 20.0M 安装中... │";
+    newSpinRef.className = "l hl";
+    newTerm.line("│ " + barFilled(76, 40) + " 76% (1/1) │", "border");
+    newTerm.line("│      " + barFilled(100, 34) + " 100% 安装中 │", "border");
+  }, 8200);
+
+  // 修复版：完成 + 统计
+  const doneT = setTimeout(() => {
+    newSpinRef.textContent = "│ ✓ firefox 升级完成 · 8s │";
+    newSpinRef.className = "l ok";
+    newTerm.line("│   🕐 总耗时:  8s    │", "border");
+    newTerm.line("│   ✓ 成功:  1 个   │", "ok");
+  }, 9000);
+
+  // 旧版：全程只有 spinner，无速度无进度
+  const oldDoneT = setTimeout(() => {
+    oldSpinRef.textContent = "│ ✓ firefox (cask) · ? 升级完成 · 9s │";
+    oldSpinRef.className = "l ok";
+    oldTerm.line("│ " + barFilled(100, 40) + " 100% (1/1) │", "border");
+    oldTerm.line("│   🕐 总耗时:  9s    │", "border");
+    oldTerm.line("│   ✓ 成功:  1 个   │", "ok");
+    oldTerm.line("", "");
+    oldTerm.line("  ⚠ 全程无下载速度显示 —— 下载被后台静默执行", "dim");
+  }, 8800);
+
+  newTerm.line("", "");
+
+  const finishT = setTimeout(() => {
+    newTerm.line("", "");
+    newTerm.line("  ✓ 下载阶段实时显示 MB/s 速度", "dim ok");
+    newTerm.line("  ✓ 包大小自动解析 20.0M", "dim ok");
+    stop(false);
+  }, 9600);
+
+  timer = { spinTick, curlStart, curlTick: null, installT, doneT, oldDoneT, finishT };
+}
+
+function stop(final) {
+  playing = false;
+  document.getElementById("playBtn").textContent = final ? "▶ 重新播放" : "▶ 继续";
+  if (timer) {
+    clearInterval(timer.spinTick);
+    if (timer.curlTick) clearInterval(timer.curlTick);
+  }
+}
+
+document.getElementById("playBtn").addEventListener("click", () => {
+  if (playing) { stop(false); return; }
+  const btn = document.getElementById("playBtn");
+  if (btn.textContent === "▶ 重新播放") { reset(); }
+  play();
+});
+
+document.getElementById("resetBtn").addEventListener("click", () => {
+  if (timer) {
+    clearInterval(timer.spinTick);
+    if (timer.curlTick) clearInterval(timer.curlTick);
+    clearTimeout(timer.curlStart); clearTimeout(timer.installT);
+    clearTimeout(timer.doneT); clearTimeout(timer.oldDoneT); clearTimeout(timer.finishT);
+  }
+  playing = false;
+  document.getElementById("playBtn").textContent = "▶ 播放对比";
+  reset();
+});
+
+reset();
+</script>
+</body>
+</html>
