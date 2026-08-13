@@ -1,0 +1,17 @@
+# CNB 流水线：开发阶段测试（Linux 容器）
+# 说明：brew audit 依赖 macOS Homebrew，CNB 无 macOS runner，该步在 GitHub Actions 补跑
+main:
+  push:
+    - name: 测试
+      docker:
+        image: ubuntu:24.04
+      stages:
+        - name: 准备环境
+          script: |
+            apt-get update -qq >/dev/null 2>&1
+            apt-get install -y -qq zsh python3 >/dev/null 2>&1
+            zsh --version
+        - name: zsh 语法检查
+          script: zsh -n brew-ua
+        - name: 冒烟测试（stub brew，无网络依赖）
+          script: zsh scripts/test.sh
