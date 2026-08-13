@@ -8,9 +8,10 @@ main:
       stages:
         - name: 准备环境
           script: |
-            apt-get update -qq >/dev/null 2>&1
-            apt-get install -y -qq zsh python3 >/dev/null 2>&1
+            apt-get update -qq
+            apt-get install -y -qq zsh python3
             zsh --version
+            python3 --version
         - name: zsh 语法检查
           script: zsh -n brew-ua
         - name: 冒烟测试（stub brew，无网络依赖）
