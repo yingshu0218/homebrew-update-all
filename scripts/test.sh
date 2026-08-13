@@ -84,7 +84,9 @@ check "统计摘要 (成功2/失败0)" "echo \"\$STRIP\" | grep -q '成功:  2 �
 # ========== 场景 2：超时机制 ==========
 echo "[场景 2] 下载超时（BUO 卡死缺陷的防护）"
 rm -f "$WORK/home/call.log"
-run_ua "$WORK/s2.log" STUB_HANG_NAME=fake-a BREW_UA_FETCH_TIMEOUT=2
+# 超时用 8s：CI runner 上 python3/script/brew 启动链路开销大，
+# 2s 会让正常下载的包也误超时；8s 对无限 hang 的 fake-a 仍能触发超时
+run_ua "$WORK/s2.log" STUB_HANG_NAME=fake-a BREW_UA_FETCH_TIMEOUT=8
 RC=$?
 OUT=$(tr -d '\r' < "$WORK/s2.log")
 check "卡住的包标记下载超时" "echo \"\$OUT\" | grep -q '下载超时'"
