@@ -7,4 +7,8 @@ class BrewUpdateAll < Formula
   def install
     bin.install "brew-ua"
   end
+
+  test do
+    assert_match "brew ua", shell_output("#{bin}/brew-ua --help")
+  end
 end
