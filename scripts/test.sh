@@ -41,16 +41,22 @@ EOF
 chmod +x "$WORK/brew"
 
 # ---------- 工具 ----------
-run_ua() { # run_ua <logfile> [env vars...]
-  local log=$1; shift
-  env "$@" HOME="$WORK/home" PATH="$WORK:/opt/homebrew/bin:/usr/bin:/bin" \
-    /usr/bin/script -q /dev/null zsh "$ROOT/brew-ua" c auto > "$log" 2>&1
+run_ua() { # run_ua <logfile> <filter:c|f> [env vars...]
+  local log=$1 filter=$2; shift 2
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    env "$@" HOME="$WORK/home" PATH="$WORK:/opt/homebrew/bin:/usr/bin:/bin" \
+      /usr/bin/script -q /dev/null zsh "$ROOT/brew-ua" "$filter" auto > "$log" 2>&1
+  else
+    # Linux util-linux 的 script 语法：-qec "cmd" file
+    env "$@" HOME="$WORK/home" PATH="$WORK:/usr/bin:/bin" \
+      /usr/bin/script -qec "zsh $ROOT/brew-ua $filter auto" /dev/null > "$log" 2>&1
+  fi
 }
 
 run_ua_notty() { # 非 TTY：直接管道，无 script 伪终端
-  local log=$1; shift
+  local log=$1 filter=$2; shift 2
   env "$@" HOME="$WORK/home" PATH="$WORK:/opt/homebrew/bin:/usr/bin:/bin" \
-    zsh "$ROOT/brew-ua" c auto > "$log" 2>&1
+    zsh "$ROOT/brew-ua" "$filter" auto > "$log" 2>&1
 }
 
 check() { # check <desc> <cond...>
@@ -68,7 +74,7 @@ mkdir -p "$WORK/home"
 # ========== 场景 1：两阶段正常流程 ==========
 echo "[场景 1] 两阶段正常流程（速度/大小/顺序/完成）"
 rm -f "$WORK/home/call.log"
-run_ua "$WORK/s1.log"
+run_ua "$WORK/s1.log" c
 RC=$?
 OUT=$(tr -d '\r' < "$WORK/s1.log")
 STRIP=$(echo "$OUT" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
@@ -86,7 +92,7 @@ echo "[场景 2] 下载超时（BUO 卡死缺陷的防护）"
 rm -f "$WORK/home/call.log"
 # 超时用 8s：CI runner 上 python3/script/brew 启动链路开销大，
 # 2s 会让正常下载的包也误超时；8s 对无限 hang 的 fake-a 仍能触发超时
-run_ua "$WORK/s2.log" STUB_HANG_NAME=fake-a BREW_UA_FETCH_TIMEOUT=8
+run_ua "$WORK/s2.log" c STUB_HANG_NAME=fake-a BREW_UA_FETCH_TIMEOUT=8
 RC=$?
 OUT=$(tr -d '\r' < "$WORK/s2.log")
 check "卡住的包标记下载超时" "echo \"\$OUT\" | grep -q '下载超时'"
@@ -112,7 +118,7 @@ check "失败使退出码为 1" "[ \"\$RC\" -eq 1 ]"
 # ========== 场景 3：失败隔离 ==========
 echo "[场景 3] 下载失败隔离（失败包跳过安装，其余继续）"
 rm -f "$WORK/home/call.log"
-run_ua "$WORK/s3.log" STUB_FAIL_NAME=fake-a
+run_ua "$WORK/s3.log" c STUB_FAIL_NAME=fake-a
 OUT=$(tr -d '\r' < "$WORK/s3.log")
 check "失败的包无安装调用" "! grep -q 'reinstall --cask fake-a' \"\$WORK/home/call.log\""
 check "成功包正常安装" "grep -q 'reinstall --cask fake-b' \"\$WORK/home/call.log\""
@@ -121,14 +127,13 @@ check "失败计入统计" "echo \"\$OUT\" | grep -q '下载失败'"
 # ========== 场景 4：formula 两阶段 ==========
 echo "[场景 4] formula 走 --formula fetch（非 cask 分支）"
 rm -f "$WORK/home/call.log"
-env "$@" HOME="$WORK/home" PATH="$WORK:/opt/homebrew/bin:/usr/bin:/bin" \
-  /usr/bin/script -q /dev/null zsh "$ROOT/brew-ua" f auto > "$WORK/s4.log" 2>&1
+run_ua "$WORK/s4.log" f
 check "fetch 使用 --formula" "grep -q 'fetch --formula fake-a' \"\$WORK/home/call.log\""
 
 # ========== 场景 5：非 TTY 无 ANSI ==========
 echo "[场景 5] 非 TTY 输出无 ANSI 控制符"
 rm -f "$WORK/home/call.log"
-run_ua_notty "$WORK/s5.log"
+run_ua_notty "$WORK/s5.log" c
 check "无 \\x1b 控制符" "! grep -q $'\x1b' \"\$WORK/s5.log\""
 
 echo ""

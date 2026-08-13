@@ -684,9 +684,20 @@ function _run_fetch() {
   _sub_progress_bar 0 0 "下载中..." 0
 
   # 后台 fetch：python setsid 包装 script，使 fetch 自成进程组（超时整组 kill）
-  # （Homebrew 6.x 不接受 "brew --verbose fetch"，用环境变量 HOMEBREW_VERBOSE=1）
+  # （Homebrew 6.x 不接受 "brew --verbose fetch"，用环境变量 HOMEBREW_VERBOSE=1；
+  #   script 语法 macOS/Linux 不同，按平台分支）
   local fetch_pid
-  python3 -c 'import os,sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])' /usr/bin/script -e -q /dev/null env HOMEBREW_VERBOSE=1 brew fetch "$fetch_flag" "$name" > "$log_file" 2>&1 &
+  python3 - "$fetch_flag" "$name" > "$log_file" 2>&1 << 'PYEOF' &
+import os, sys, platform
+fetch_flag, name = sys.argv[1], sys.argv[2]
+inner = ["env", "HOMEBREW_VERBOSE=1", "brew", "fetch", fetch_flag, name]
+if platform.system() == "Darwin":
+    cmd = ["/usr/bin/script", "-e", "-q", "/dev/null"] + inner
+else:
+    cmd = ["/usr/bin/script", "-qec", " ".join(inner), "/dev/null"]
+os.setsid()
+os.execv(cmd[0], cmd)
+PYEOF
   fetch_pid=$!
 
   # 下载轮询：解析日志 "Downloading X/Y" 算速度 + 超时检查，重画 3 行
