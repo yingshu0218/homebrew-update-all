@@ -95,6 +95,14 @@ else
   echo "  ✗ 其余包正常完成"
   echo "  --- s2.log 尾部（诊断）---"
   tail -15 "$WORK/s2.log" | tr -d '\r'
+  echo "  --- call.log（诊断）---"
+  cat "$WORK/home/call.log" 2>/dev/null | tail -10
+  echo "  --- fake-b.log（诊断）---"
+  local tdir=$(echo "$OUT" | grep -oE "${TMPDIR:-/tmp}/brew-ua\.[^/]*" | head -1)
+  if [[ -n "$tdir" ]]; then
+    echo "  [dir: $tdir]"
+    cat "$tdir/fake-b.log" 2>/dev/null | tr -d '\r' | tail -8
+  fi
   FAIL=$((FAIL + 1))
 fi
 check "失败使退出码为 1" "[ \"\$RC\" -eq 1 ]"
