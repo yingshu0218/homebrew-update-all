@@ -47,8 +47,8 @@ run_ua() { # run_ua <logfile> <filter:c|f> [env vars...]
     env "$@" HOME="$WORK/home" PATH="$WORK:/opt/homebrew/bin:/usr/bin:/bin" \
       /usr/bin/script -q /dev/null zsh "$ROOT/brew-ua" "$filter" auto > "$log" 2>&1
   else
-    # Linux util-linux 的 script 语法：-qec "cmd" file
-    env "$@" HOME="$WORK/home" PATH="$WORK:/usr/bin:/bin" \
+    # Linux util-linux 的 script 语法：-qec "cmd" file；PATH 需含 /usr/local/bin（python3 位置）
+    env "$@" HOME="$WORK/home" PATH="$WORK:/usr/local/bin:/usr/bin:/bin" \
       /usr/bin/script -qec "zsh $ROOT/brew-ua $filter auto" /dev/null > "$log" 2>&1
   fi
 }
