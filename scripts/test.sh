@@ -88,7 +88,15 @@ run_ua "$WORK/s2.log" STUB_HANG_NAME=fake-a BREW_UA_FETCH_TIMEOUT=2
 RC=$?
 OUT=$(tr -d '\r' < "$WORK/s2.log")
 check "卡住的包标记下载超时" "echo \"\$OUT\" | grep -q '下载超时'"
-check "其余包正常完成" "echo \"\$OUT\" | grep -c '升级完成' | grep -q '^1$'"
+if echo "$OUT" | grep -c '升级完成' | grep -q '^1$'; then
+  echo "  ✓ 其余包正常完成"
+  PASS=$((PASS + 1))
+else
+  echo "  ✗ 其余包正常完成"
+  echo "  --- s2.log 尾部（诊断）---"
+  tail -15 "$WORK/s2.log" | tr -d '\r'
+  FAIL=$((FAIL + 1))
+fi
 check "失败使退出码为 1" "[ \"\$RC\" -eq 1 ]"
 
 # ========== 场景 3：失败隔离 ==========
