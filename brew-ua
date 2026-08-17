@@ -87,8 +87,12 @@ EOF
 }
 
 function _repeat_char() {
-  local char="$1" count="$2"
-  printf "%${count}s" "" | tr " " "$char"
+  # zsh 原生循环拼接（无外置命令、无 locale 依赖）。
+  # 曾用 printf|tr：GNU tr 在 C locale 下把多字节字符按字节拆集合，
+  # ░ 会被替换成损坏字节序列，Linux/CNB 终端显示乱码
+  local char="$1" count="$2" out=""
+  repeat "$count" out+="$char"
+  echo -n "$out"
 }
 
 function _fmt_duration() {
