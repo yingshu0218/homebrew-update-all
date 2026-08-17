@@ -149,12 +149,20 @@ check "无 \\x1b 控制符" "! grep -q $'\x1b' \"\$WORK/s5.log\""
 # ========== 场景 6：下载中实时大小/速度（缓存文件监控） ==========
 echo "[场景 6] 下载中实时大小/速度（缓存文件监控，真实 Homebrew 无 Downloading 帧）"
 rm -f "$WORK/home/call.log"
+# 清理前序场景残留的缓存文件（否则轮询立即命中已完成文件，无法观察下载中状态）
+rm -rf "$WORK/home/cache"
+mkdir -p "$WORK/home/cache"
 # STUB_SLOW: 让 stub fetch 慢速写入文件，便于断言下载中的帧
 # 通过小延时写入（每个包 30*0.2s=6s），确保轮询能捕捉中间状态
 run_ua "$WORK/s6.log" c STUB_INCREMENT_MS=200
 OUT6=$(tr -d '\r' < "$WORK/s6.log")
+# 剥离 ANSI：子进度条在 "X.XMB" 与 "下载中" 之间夹着颜色码（\x1b[38;5;146m），
+# 必须剥离后才能用 [[:space:]]+ 断言空格分隔（与场景1统计摘要的剥离方式一致）
+STRIP6=$(echo "$OUT6" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
 check "下载中显示实时大小 (· X.XMB)" "echo \"\$OUT6\" | grep -qE '下载中 [0-9.]+(MB|KB)d' || echo \"\$OUT6\" | grep -qE '下载中[^|]*[0-9.]+(MB|KB)'"
 check "下载中显示实时速度 (MB/s)" "echo \"\$OUT6\" | grep -qE '[0-9.]+(MB|KB)/s'"
+check "子进度条显示已下载量 (非裸?)" \
+  "echo \"\$STRIP6\" | grep -qE '░+[^|]*[0-9.]+(MB|KB)[[:space:]]+下载中'"
 
 echo ""
 echo "===== 结果: $PASS 通过 / $FAIL 失败 ====="

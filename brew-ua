@@ -670,13 +670,18 @@ function _sub_progress_bar() {
     filled=$(( current * bar_width / total ))
     percent_str=$(printf "%3d%%" "$percent")
   else
-    percent_str="  ?"
+    # 总量未知（brew 6.x 不报总大小）：显示已下载量或下载中标记，避免裸 "?"
     local spin_count=${#SPIN_FRAMES[@]}
     local spin_pos=$(( (spin_idx % spin_count) + 1 ))
     local spin_char="$SPIN_FRAMES[$spin_pos]"
     local half_bar=$(( bar_width / 2 - 1 ))
     local bar_content="$(_repeat_char "░" "$half_bar")${C_ACCENT}${spin_char}${C_PROGRESS_BG}$(_repeat_char "░" $(( bar_width - half_bar - 1 )))"
     local bar="${C_PROGRESS_BG}${bar_content}${C_RESET}"
+    if (( current > 0 )); then
+      percent_str=" $(_fmt_size $current)"
+    else
+      percent_str="  ?"
+    fi
     local line="     ${bar} ${C_BOLD}${C_ACCENT}${percent_str} ${C_INFO}${status_text}${C_RESET}"
 
     local visible=0
@@ -958,7 +963,7 @@ TMP_BASE=$(mktemp -d "${TMPDIR:-/tmp}/brew-ua.XXXXXX" 2>/dev/null)
 [[ -z "$TMP_BASE" || ! -d "$TMP_BASE" ]] && TMP_BASE="/tmp"
 
 # 当前版本（发版时同步更新；版本自检用）
-BREW_UA_VERSION="1.8.6"
+BREW_UA_VERSION="1.8.7"
 
 # 单实例锁：PID 文件 + kill -0 探测，陈旧锁自动清理
 LOCK_FILE="$HOME/.config/brew-ua/brew-ua.lock"
