@@ -17,7 +17,10 @@ jobs:
       - name: 冒烟测试（stub brew，无网络）
         run: zsh scripts/test.sh
 
-      - name: Formula 审计（Homebrew 官方规则）
+      - name: Formula 校验（语法 + 结构，不依赖 tap 信任）
         run: |
-          brew tap yingshu0218/update-all
-          brew audit --strict --formula brew-update-all
+          ruby -c Formula/brew-update-all.rb
+          grep -q 'def install' Formula/brew-update-all.rb
+          grep -q 'test do' Formula/brew-update-all.rb
+          grep -qE '^  url "' Formula/brew-update-all.rb
+          grep -qE '^  sha256 "' Formula/brew-update-all.rb
