@@ -156,13 +156,12 @@ mkdir -p "$WORK/home/cache"
 # 通过小延时写入（每个包 30*0.2s=6s），确保轮询能捕捉中间状态
 run_ua "$WORK/s6.log" c STUB_INCREMENT_MS=200
 OUT6=$(tr -d '\r' < "$WORK/s6.log")
-# 剥离 ANSI：子进度条在 "X.XMB" 与 "下载中" 之间夹着颜色码（\x1b[38;5;146m），
-# 必须剥离后才能用 [[:space:]]+ 断言空格分隔（与场景1统计摘要的剥离方式一致）
-STRIP6=$(echo "$OUT6" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
+# 断言统一在原始 OUT6 上用 [^|]* 跨 ANSI 码匹配（不依赖 sed 剥离：
+# GNU sed(Linux CI) 与 BSD sed(macOS) 对 \x1b 转义行为不同，剥离法在 Linux 失效）
 check "下载中显示实时大小 (· X.XMB)" "echo \"\$OUT6\" | grep -qE '下载中 [0-9.]+(MB|KB)d' || echo \"\$OUT6\" | grep -qE '下载中[^|]*[0-9.]+(MB|KB)'"
 check "下载中显示实时速度 (MB/s)" "echo \"\$OUT6\" | grep -qE '[0-9.]+(MB|KB)/s'"
 check "子进度条显示已下载量 (非裸?)" \
-  "echo \"\$STRIP6\" | grep -qE '░+[^|]*[0-9.]+(MB|KB)[[:space:]]+下载中'"
+  "echo \"\$OUT6\" | grep -qE '░+[^|]*[0-9.]+(MB|KB)[^|]*下载中' || echo \"\$OUT6\" | grep -qE '░[^|]*[0-9.]+(MB|KB)[[:space:]]+下载中'"
 
 echo ""
 echo "===== 结果: $PASS 通过 / $FAIL 失败 ====="
