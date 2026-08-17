@@ -14,9 +14,15 @@ FAIL=0
 cat > "$WORK/brew" <<'EOF'
 #!/bin/zsh
 echo "$(date +%s%3N) $*" >> "$HOME/call.log"
+CACHE_DIR="$HOME/cache"
+mkdir -p "$CACHE_DIR"
 case "$1" in
   update) sleep 0.2; exit 0 ;;
   outdated) echo -e "fake-a\nfake-b"; exit 0 ;;
+  --cache)
+    # 输出 brew-ua 应轮询的缓存路径（下载中 +.incomplete）
+    echo "$CACHE_DIR/$3-10.0MB.tmp"
+    exit 0 ;;
   fetch)
     if [ -n "$STUB_HANG_NAME" ] && [ "$3" = "$STUB_HANG_NAME" ]; then
       echo "hang start"; while true; do sleep 1; done
@@ -24,13 +30,17 @@ case "$1" in
     if [ -n "$STUB_FAIL_NAME" ] && [ "$3" = "$STUB_FAIL_NAME" ]; then
       echo "fail start"; sleep 0.4; exit 1
     fi
-    local i pct mb frac
+    # 真实创建下载缓存文件并逐步增长（模拟 Homebrew 下载写入行为）
+    # STUB_INCREMENT_MS 控制每次写入间隔（默认 60ms，场景6 用 200ms 便于观察）
+    local inc_ms="${STUB_INCREMENT_MS:-60}"
+    local target="$CACHE_DIR/$3-10.0MB.tmp.incomplete"
+    local i mb
     for i in {1..30}; do
-      pct=$((i * 3)); mb=$((pct * 10 / 100)); frac=$(( (pct * 10 * 10 / 100) % 10 ))
-      printf '\rCask %s (1.0)                    Downloading   %d.%dMB/ 10.0MB' "$3" "$mb" "$frac"
-      sleep 0.06
+      mb=$((i * 10 / 30))
+      dd if=/dev/zero of="$target" bs=1024 count=$((mb * 1024)) 2>/dev/null
+      sleep $((inc_ms / 1000)).$(( (inc_ms % 1000) / 100 ))
     done
-    printf '\rCask %s (1.0)                    Downloading  10.0MB/ 10.0MB\n' "$3"
+    mv "$target" "${target%.incomplete}"
     exit 0 ;;
   reinstall) sleep 0.3; exit 0 ;;
   upgrade) sleep 0.3; exit 0 ;;
@@ -135,6 +145,16 @@ echo "[场景 5] 非 TTY 输出无 ANSI 控制符"
 rm -f "$WORK/home/call.log"
 run_ua_notty "$WORK/s5.log" c
 check "无 \\x1b 控制符" "! grep -q $'\x1b' \"\$WORK/s5.log\""
+
+# ========== 场景 6：下载中实时大小/速度（缓存文件监控） ==========
+echo "[场景 6] 下载中实时大小/速度（缓存文件监控，真实 Homebrew 无 Downloading 帧）"
+rm -f "$WORK/home/call.log"
+# STUB_SLOW: 让 stub fetch 慢速写入文件，便于断言下载中的帧
+# 通过小延时写入（每个包 30*0.2s=6s），确保轮询能捕捉中间状态
+run_ua "$WORK/s6.log" c STUB_INCREMENT_MS=200
+OUT6=$(tr -d '\r' < "$WORK/s6.log")
+check "下载中显示实时大小 (· X.XMB)" "echo \"\$OUT6\" | grep -qE '下载中 [0-9.]+(MB|KB)d' || echo \"\$OUT6\" | grep -qE '下载中[^|]*[0-9.]+(MB|KB)'"
+check "下载中显示实时速度 (MB/s)" "echo \"\$OUT6\" | grep -qE '[0-9.]+(MB|KB)/s'"
 
 echo ""
 echo "===== 结果: $PASS 通过 / $FAIL 失败 ====="

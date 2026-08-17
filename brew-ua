@@ -148,6 +148,46 @@ function _get_terminal_width() {
   echo "$w"
 }
 
+# ---------- 下载文件监控 ----------
+# _cache_path <name> <type> —— 通过 brew --cache 获取缓存完整路径（下载中和已完成都定位）
+# 返回：0=成功（输出路径） 1=失败（无输出）
+function _cache_path() {
+  local name=$1 type=$2
+  local flag=$([[ "$type" == "cask" ]] && echo "--cask" || echo "--formula")
+  brew --cache "$flag" "$name" 2>/dev/null | head -1
+}
+
+# _file_size <path> —— 跨平台取文件字节数（先试 macOS 语法，再试 Linux，避免 zsh nounset 下相对命令解析问题）
+function _file_size() {
+  local path=$1
+  local s
+  s=$(/usr/bin/stat -f%z "$path" 2>/dev/null)
+  if (( ${#s} == 0 )); then
+    s=$(/usr/bin/stat -c%s "$path" 2>/dev/null)
+  fi
+  echo "$s"
+}
+
+# _find_download_file <name> <type> —— 返回当前下载中的缓存文件路径（.incomplete 优先，其次已完成文件）
+# 返回：0=找到 1=未找到
+function _find_download_file() {
+  local name=$1 type=$2
+  local cache_path
+  cache_path=$(_cache_path "$name" "$type")
+  [[ -z "$cache_path" ]] && return 1
+  # 下载中：.incomplete 后缀
+  if [[ -f "$cache_path.incomplete" ]]; then
+    echo "$cache_path.incomplete"
+    return 0
+  fi
+  # 已下载完成：无后缀
+  if [[ -f "$cache_path" ]]; then
+    echo "$cache_path"
+    return 0
+  fi
+  return 1
+}
+
 # ---------- 诊断功能 ----------
 
 function _ping_host() {
@@ -700,7 +740,7 @@ os.execv(cmd[0], cmd)
 PYEOF
   fetch_pid=$!
 
-  # 下载轮询：解析日志 "Downloading X/Y" 算速度 + 超时检查，重画 3 行
+  # 下载轮询：监控缓存文件大小增长（真实磁盘写入）算速度/进度；日志 "Downloading X/Y" 帧作为补充
   spin_idx=0
   local downloaded=0
   local speed_bytes=0
@@ -708,6 +748,7 @@ PYEOF
   local prev_ms=$(( EPOCHREALTIME * 1000 ))
   local fetch_start=$(date +%s)
   local timed_out=0
+  local dl_file=""
   while kill -0 "$fetch_pid" 2>/dev/null; do
     # 超时检查：超过 BREW_UA_FETCH_TIMEOUT 秒则整组终止
     if (( $(date +%s) - fetch_start > fetch_timeout )); then
@@ -718,14 +759,28 @@ PYEOF
       timed_out=1
       break
     fi
-    # 解析 Downloading X/Y
+    # 主通道：定位下载缓存文件（.incomplete 优先），取实际字节数做进度/速度
+    local cur_bytes=0
+    if [[ -z "$dl_file" ]]; then
+      local found_file
+      found_file=$(_find_download_file "$name" "$type")
+      if [[ -n "$found_file" ]]; then
+        dl_file=$found_file
+      fi
+    fi
+    if [[ -n "$dl_file" ]]; then
+      cur_bytes=$(_file_size "$dl_file")
+      (( cur_bytes > downloaded )) && downloaded=$cur_bytes
+    fi
+    # 补充通道：解析 Downloading X/Y 帧（旧版 Homebrew / stub 测试仍可解析到）
     local dl_line=""
     [[ -f "$log_file" ]] && dl_line=$(grep -oE 'Downloading[[:space:]]+[0-9.]+ ?[kKMGT]?i?B?[[:space:]]*/[[:space:]]*[0-9.]+ ?[kKMGT]?i?B?' "$log_file" 2>/dev/null | tail -1)
     if [[ -n "$dl_line" ]]; then
       local dl_cur=$(echo "$dl_line" | grep -oE '[0-9.]+ ?[kKMGT]?i?B?' | head -1)
       local dl_tot=$(echo "$dl_line" | grep -oE '[0-9.]+ ?[kKMGT]?i?B?' | tail -1)
       local tot_bytes=$(_parse_size "$dl_tot")
-      downloaded=$(_parse_size "$dl_cur")
+      local cur_parsed=$(_parse_size "$dl_cur")
+      (( cur_parsed > downloaded )) && downloaded=$cur_parsed
       if (( pkg_size <= 0 && tot_bytes > 0 )); then
         pkg_size=$tot_bytes
         size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
@@ -749,9 +804,14 @@ PYEOF
     local spin_char="$SPIN_FRAMES[$spin_pos]"
     local speed_display=""
     (( speed_bytes > 0 )) && speed_display=" ${C_ACCENT}$(_fmt_speed $speed_bytes)${C_RESET}"
+    # 大小显示：总大小已知显示 "· 总大小"，未知则显示当前已下载量（缓存文件监控法）
+    local cur_size_display="$size_display"
+    if (( downloaded > 0 && pkg_size <= 0 )); then
+      cur_size_display=" ${C_MUTED}· $(_fmt_size $downloaded)${C_RESET}"
+    fi
     _cursor_up 3
     _clr_line
-    local dl_status="${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${size_display} ${C_INFO}下载中${C_RESET}${speed_display}"
+    local dl_status="${C_PRIMARY}${spin_char}${C_RESET} ${type_icon} ${type_color}${name}${C_RESET} ${C_MUTED}(${type})${cur_size_display} ${C_INFO}下载中${C_RESET}${speed_display}"
     local dl_stripped="${dl_status//$'\033'[0-9;]*[a-zA-Z]/}"
     local dl_pad=$(( $(_get_terminal_width) - 2 - ${#dl_stripped} ))
     (( dl_pad < 1 )) && dl_pad=1
@@ -774,15 +834,31 @@ PYEOF
     return 1
   fi
 
-  # 兜底：若下载期间未解析到包大小，从日志最后一行解析
+  # 兜底：若下载期间未解析到包大小
   if (( pkg_size <= 0 )); then
-    local size_str=$(tr -d '\r' < "$log_file" | grep -oE '[0-9.]+ ?[kKMGT]i?B?' | head -1)
-    if [[ -n "$size_str" ]]; then
-      pkg_size=$(_parse_size "$size_str")
-      if (( pkg_size > 0 )); then
+    # 1) 缓存文件最终大小（最准确）
+    local final_file
+    final_file=$(_find_download_file "$name" "$type")
+    if [[ -n "$final_file" ]]; then
+      local final_size
+      final_size=$(_file_size "$final_file")
+      if (( final_size > 0 )); then
+        pkg_size=$final_size
         size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
         total_size=$(( total_size - pkg_sizes[idx] + pkg_size ))
         pkg_sizes[$idx]=$pkg_size
+      fi
+    fi
+    # 2) 日志中的大小字符串（最后手段）
+    if (( pkg_size <= 0 )); then
+      local size_str=$(tr -d '\r' < "$log_file" | grep -oE '[0-9.]+ ?[kKMGT]i?B?' | head -1)
+      if [[ -n "$size_str" ]]; then
+        pkg_size=$(_parse_size "$size_str")
+        if (( pkg_size > 0 )); then
+          size_display=" ${C_MUTED}· $(_fmt_size $pkg_size)${C_RESET}"
+          total_size=$(( total_size - pkg_sizes[idx] + pkg_size ))
+          pkg_sizes[$idx]=$pkg_size
+        fi
       fi
     fi
   fi
@@ -882,7 +958,7 @@ TMP_BASE=$(mktemp -d "${TMPDIR:-/tmp}/brew-ua.XXXXXX" 2>/dev/null)
 [[ -z "$TMP_BASE" || ! -d "$TMP_BASE" ]] && TMP_BASE="/tmp"
 
 # 当前版本（发版时同步更新；版本自检用）
-BREW_UA_VERSION="1.8.5"
+BREW_UA_VERSION="1.8.6"
 
 # 单实例锁：PID 文件 + kill -0 探测，陈旧锁自动清理
 LOCK_FILE="$HOME/.config/brew-ua/brew-ua.lock"
