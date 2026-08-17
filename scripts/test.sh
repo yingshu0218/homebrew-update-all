@@ -161,12 +161,14 @@ OUT6=$(tr -d '\r' < "$WORK/s6.log")
 check "下载中显示实时大小 (· X.XMB)" "echo \"\$OUT6\" | grep -qE '下载中 [0-9.]+(MB|KB)d' || echo \"\$OUT6\" | grep -qE '下载中[^|]*[0-9.]+(MB|KB)'"
 check "下载中显示实时速度 (MB/s)" "echo \"\$OUT6\" | grep -qE '[0-9.]+(MB|KB)/s'"
 check "子进度条显示已下载量 (非裸?)" \
-  "echo \"\$OUT6\" | grep -qE '░+[^|]*[0-9.]+(MB|KB)[^|]*下载中' || echo \"\$OUT6\" | grep -qE '░[^|]*[0-9.]+(MB|KB)[[:space:]]+下载中'" || {
+  "echo \"\$OUT6\" | grep -qE '░+[^|]*[0-9.]+(MB|KB)[^|]*下载中' || echo \"\$OUT6\" | grep -qE '░[^|]*[0-9.]+(MB|KB)[[:space:]]+下载中'"
+# 断言失败时 dump 真实行情（check 内部吞掉了失败返回码，单独判断输出诊断）
+if ! echo "$OUT6" | grep -qE '░+[^|]*[0-9.]+(MB|KB)[^|]*下载中' && ! echo "$OUT6" | grep -qE '░[^|]*[0-9.]+(MB|KB)[[:space:]]+下载中'; then
   echo "  --- 子进度条行 hex dump（诊断）---"
   echo "$OUT6" | grep -a '下载中' | grep -a $'\xe2\x96\x91' | head -3 | hexdump -C | head -25
   echo "  --- 含 MB 的所有行（诊断）---"
   echo "$OUT6" | grep -a 'MB' | head -5 | tr -d '\r' | cut -c1-160
-}
+fi
 
 echo ""
 echo "===== 结果: $PASS 通过 / $FAIL 失败 ====="
