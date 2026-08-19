@@ -266,15 +266,20 @@ final class UpdateEngine: ObservableObject {
             switch result {
             case .success:
                 tasks[taskIdx].status = .downloaded
+                tasks[taskIdx].speedBytesPerSec = 0 // 停止下载,速度归零,显示"已下载待安装"
+                tasks[taskIdx].finishedAt = Date()
                 appendLog("✓ \(entry.name) 下载完成")
             case .timeout:
                 tasks[taskIdx].status = .timeout
+                tasks[taskIdx].finishedAt = Date()
                 appendLog("✗ \(entry.name) 下载超时(\(Int(fetchTimeout))s),已隔离")
             case .failed(let reason):
                 tasks[taskIdx].status = .failed(reason)
+                tasks[taskIdx].finishedAt = Date()
                 appendLog("✗ \(entry.name) 下载失败:\(reason),已隔离")
             case .canceled:
                 tasks[taskIdx].status = .canceled
+                tasks[taskIdx].finishedAt = Date()
                 appendLog("已取消 \(entry.name) 下载")
             }
         }
@@ -290,7 +295,8 @@ final class UpdateEngine: ObservableObject {
         for (idx, task) in toInstall.enumerated() {
             guard let taskIdx = tasks.firstIndex(where: { $0.id == task.id }) else { continue }
             tasks[taskIdx].status = .installing
-            tasks[taskIdx].startedAt = Date()
+            tasks[taskIdx].finishedAt = nil
+            tasks[taskIdx].speedBytesPerSec = 0
             appendLog("安装 [\(idx + 1)/\(toInstall.count)] \(task.name)…")
             do {
                 let entry = OutdatedEntry(name: task.name, currentVersion: "?", newestVersion: "?", kind: task.kind, isIgnored: false)

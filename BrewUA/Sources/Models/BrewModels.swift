@@ -96,6 +96,28 @@ struct PackageTask: Identifiable {
         sizeText(Double(bytesDownloaded)) + (totalBytes > 0 ? " / " + sizeText(Double(totalBytes)) : "")
     }
 
+    /// 状态徽章文字(下载/安装阶段分离,失败区分来源)
+    var statusDisplayText: String {
+        switch status {
+        case .queued: return "等待中"
+        case .downloading: return "下载中"
+        case .downloaded: return "已下载待安装"
+        case .installing: return "安装中"
+        case .succeeded: return "已完成安装"
+        case .failed(let reason): return reason.hasPrefix("安装") ? "安装失败" : "下载失败"
+        case .timeout: return "下载超时"
+        case .canceled: return "已取消"
+        }
+    }
+
+    /// 进度详情:下载阶段显示 "23.4MB / 275MB · 45%"
+    var progressDetailText: String {
+        if totalBytes > 0, bytesDownloaded > 0 {
+            return "\(downloadedText) · \(Int(progress * 100))%"
+        }
+        return downloadedText
+    }
+
     private func sizeText(_ bytes: Double) -> String {
         let units = ["B", "KB", "MB", "GB"]
         var v = bytes

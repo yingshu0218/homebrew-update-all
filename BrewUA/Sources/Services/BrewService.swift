@@ -110,38 +110,109 @@ final class BrewService {
 
     // MARK: - fetch / install
 
+    /// 从 `brew info --json=v2` 输出里提取首个下载 URL(回退解析)。
+    /// 单独抽成静态方法便于单测。
+    static func extractDownloadURL(fromInfoJSON json: String) -> String? {
+        struct InfoPayload: Decodable {
+            struct Formula: Decodable {
+                let urls: [String]?
+                let url: String?
+            }
+            struct Cask: Decodable {
+                let url: String?
+                let artifacts: [CaskArtifact]?
+                struct CaskArtifact: Decodable {
+                    let url: String?
+                }
+            }
+            let formulae: [Formula]
+            let casks: [Cask]
+        }
+        guard let data = json.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(InfoPayload.self, from: data) else { return nil }
+        if let f = payload.formulae.first {
+            if let urls = f.urls, !urls.isEmpty { return urls.first }
+            if let u = f.url { return u }
+        }
+        if let c = payload.casks.first {
+            if let u = c.url { return u }
+            if let artifacts = c.artifacts {
+                for a in artifacts where a.url != nil { return a.url }
+            }
+        }
+        return nil
+    }
+
+    /// HEAD 请求下载地址,拿 `Content-Length`(字节)作为包总大小。失败返回 nil(调用侧降级)。
+    static func probeDownloadSize(urlString: String, timeout: TimeInterval = 15) -> Int64? {
+        guard let url = URL(string: urlString) else { return nil }
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = timeout
+        // 兼容部分 CDN 需要 UA,否则 403/404
+        request.setValue("curl/8.7.1", forHTTPHeaderField: "User-Agent")
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Int64?
+        URLSession.shared.dataTask(with: request) { _, resp, _ in
+            if let http = resp as? HTTPURLResponse,
+               (200..<300).contains(http.statusCode),
+               let len = http.value(forHTTPHeaderField: "Content-Length"),
+               let bytes = Int64(len), bytes > 0 {
+                result = bytes
+            }
+            semaphore.signal()
+        }.resume()
+        _ = semaphore.wait(timeout: .now() + timeout + 1)
+        return result
+    }
+
     /// 阶段1:下载单个包(流式,带进度事件)。
-    /// - `onProgress`: 收到 progress 帧(每秒若干次)时回调,含已下载/总量/速度
+    /// - `onProgress`: 收到 progress 帧时回调,含已下载/总量/速度
+    /// - 下载期间用**定时器独立轮询**缓存文件大小算速度(不依赖 brew 输出事件频率)
+    /// - 总量来源:头部仅当日志出现下载完成/失败或超时时中止
     /// - @MainActor:与 update 同理,保证 onLine/onProgress 在主线程执行,
     ///   避免后台 stream 恢复点改 @Published 触发 SIGABRT
     @MainActor
     func fetch(package: OutdatedEntry, onLine: @escaping (String) -> Void, onProgress: @escaping (Int64, Int64, Double) -> Void) async throws {
         let flag = package.kind == .formula ? "--formula" : "--cask"
         let proc = StreamedProcess(brewArguments: ["fetch", flag, package.name])
-        var lastSample = Date()
+        // 先探测包大小(HEAD,非阻塞等待)
+        var total: Int64 = 0
+        if let json = try? await runSerialized(["info", "--json=v2", flag, package.name]),
+           let url = Self.extractDownloadURL(fromInfoJSON: json) {
+            total = Self.probeDownloadSize(urlString: url) ?? 0
+        }
+        // 独立定时器轮询缓存文件大小算速度(不依赖 brew 输出事件频率)
+        let poll = PollingMonitor(packageName: package.name, kind: package.kind, interval: 0.6) { bytes, speed in
+            onProgress(bytes, total, speed)
+        }
+        poll.start()
         var lastBytes: Int64 = 0
         var reportedOnce = false
-        for try await event in proc.run() {
-            onLine(event.text)
-            // 主通道:采样缓存文件大小增长;0.8s 最小间隔避免速度抖跳
-            if let size = Self.downloadFileBytes(packageName: package.name, kind: package.kind) {
-                let now = Date()
-                let dt = now.timeIntervalSince(lastSample)
-                if dt >= 0.8 || size == lastBytes {
-                    let speed = dt > 0 ? Double(size - lastBytes) / dt : 0
-                    lastSample = now
+        do {
+            for try await event in proc.run() {
+                onLine(event.text)
+                // 保留流内采样,作为定时器之外的一层兜底(缓存已就绪但极早结束的场景)
+                if let size = poll.sample() {
                     lastBytes = size
-                    onProgress(size, 0, speed)
                     reportedOnce = true
                 }
             }
+        } catch {
+            poll.stop()
+            let finalBytes = reportedOnce ? lastBytes : 0
+            onProgress(finalBytes, total, 0)
+            throw error
         }
-        // 若从未报告过大小(可能已完全缓存),至少标记完成
-        if !reportedOnce {
-            onProgress(0, 0, 0)
+        poll.stop()
+        // 结束时:上报当前缓存大小(下载完成后 .incomplete 改名为正式文件,最后一次采样已覆盖)
+        if let finalSize = BrewService.currentDownloadFileSize(packageName: package.name) {
+            onProgress(finalSize, total, 0)
+        } else if reportedOnce {
+            onProgress(lastBytes, total, 0)
         } else {
-            // 下载结束,最终回调一次让 UI 收尾(如显示完成状态)
-            onProgress(lastBytes, 0, 0)
+            // 无任何可见进度(极小文件或直接命中缓存):标记完成
+            onProgress(total, total, 0)
         }
     }
 
@@ -288,29 +359,130 @@ final class BrewService {
     /// - 优先 `.incomplete`(下载中);下载完成后文件被改名为正式文件名,兜底匹配。
     /// - 失败返回 nil(上层降级为只解析日志)
     static func downloadFileBytes(packageName: String, kind: PackageKind) -> Int64? {
-        guard let cacheDir = try? FileManager.default.url(
-            for: .cachesDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: false
-        ) else { return nil }
-        // brew 缓存目录通常为 <cache>/Homebrew/downloads
-        let downloadsDir = cacheDir.appendingPathComponent("Homebrew/downloads")
-        let enumerator = FileManager.default.enumerator(
-            at: downloadsDir,
-            includingPropertiesForKeys: [.fileSizeKey],
+        currentDownloadFileSize(packageName: packageName)
+    }
+
+    /// 在 brew 下载目录里找与该包相关的"活跃下载文件"大小。
+    /// - 包名匹配:名称前缀包含包名(兼容 `xxx--<name>--...` 的 hash 文件名,也兼容明文 URL 文件名)
+    /// - 下载中文件带 `.incomplete` 后缀;完成后改名为正式文件名
+    /// - 过滤 `.json`(那是 API 元数据,不是包体)
+    static func currentDownloadFileSize(packageName: String) -> Int64? {
+        guard let downloadsDir = brewDownloadsDirectory() else { return nil }
+        guard let urls = try? FileManager.default.contentsOfDirectory(
+            at: downloadsDir, includingPropertiesForKeys: [.fileSizeKey],
             options: [.skipsHiddenFiles]
-        )
-        guard let files = enumerator?.allObjects as? [URL] else { return nil }
-        // 首选手工用包名匹配的文件
-        let candidates = files.filter { url in
+        ) else { return nil }
+        // 优先 .incomplete(正在下载),无则取最近改动的正式文件
+        var candidates: [(URL, Int64)] = []
+        for url in urls {
             let name = url.lastPathComponent
-            return name.contains(packageName) && (name.hasSuffix(".incomplete") || !name.hasSuffix(".json"))
+            guard name.contains(packageName), !name.hasSuffix(".json") else { continue }
+            guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  let size = (attrs[.size] as? NSNumber)?.int64Value, size > 0 else { continue }
+            candidates.append((url, size))
         }
-        guard let target = candidates.first,
-              let attrs = try? FileManager.default.attributesOfItem(atPath: target.path),
-              let size = attrs[.size] as? NSNumber else { return nil }
-        return size.int64Value
+        guard !candidates.isEmpty else { return nil }
+        if let incomplete = candidates.first(where: { $0.0.lastPathComponent.hasSuffix(".incomplete") }) {
+            return incomplete.1
+        }
+        // 下载完成后没有 .incomplete,取最新改动的
+        let sorted = candidates.sorted { l, r in
+            let lDate = (try? FileManager.default.attributesOfItem(atPath: l.0.path)[.modificationDate] as? Date) ?? .distantPast
+            let rDate = (try? FileManager.default.attributesOfItem(atPath: r.0.path)[.modificationDate] as? Date) ?? .distantPast
+            return lDate > rDate
+        }
+        return sorted.first?.1
+    }
+
+    /// brew 下载缓存目录:$HOME/Library/Caches/Homebrew/downloads
+    static func brewDownloadsDirectory() -> URL? {
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Caches/Homebrew/downloads")
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir), isDir.boolValue else { return nil }
+        return dir
+    }
+}
+
+/// 下载进度轮询器:与 brew 输出流解耦,定时采样缓存文件大小,实时计算下载速度。
+/// 独立于 brew 输出事件——即使 brew 在非 TTY 下几乎不输出(如静默下载),也能持续上报速度。
+final class PollingMonitor {
+    private let monitor: () -> Int64?
+    private let interval: TimeInterval
+    private let onSample: (Int64, Double) -> Void
+    private var timer: DispatchSourceTimer?
+    private var lastSize: Int64 = 0
+    private var lastTime: Date = Date()
+    private var hasBaseline = false
+    private let queue = DispatchQueue(label: "brewua.download-monitor")
+
+    /// - Parameters:
+    ///   - sample: 返回当前已下载字节(需线程安全)
+    ///   - interval: 采样间隔秒
+    ///   - onSample: 上报 (当前大小, 速度B/s)
+    init(sample: @escaping () -> Int64?, interval: TimeInterval = 0.6,
+         onSample: @escaping (Int64, Double) -> Void) {
+        self.monitor = sample
+        self.interval = interval
+        self.onSample = onSample
+    }
+
+    convenience init(packageName: String, kind: PackageKind, interval: TimeInterval = 0.6,
+                     onSample: @escaping (Int64, Double) -> Void) {
+        self.init(sample: { BrewService.currentDownloadFileSize(packageName: packageName) },
+                  interval: interval,
+                  onSample: onSample)
+    }
+
+    /// 采样一次(由外部循环或定时器调用,返回当前大小)并报告速度。
+    /// 若采样失败返回 nil(文件未出现或已改名)。
+    func sample() -> Int64? {
+        guard let size = monitor() else { return nil }
+        let now = Date()
+        if hasBaseline {
+            let dt = now.timeIntervalSince(lastTime)
+            if dt >= 0.2 {
+                let speed = max(0, Double(size - lastSize) / dt)
+                report(size, speed)
+                lastSize = size
+                lastTime = now
+            }
+        } else {
+            hasBaseline = true
+            lastSize = size
+            lastTime = now
+            report(size, 0)
+        }
+        return size
+    }
+
+    /// 上报回调强制主线程:定时器在独立队列,后台线程直接改 @Published 会触发
+    /// SwiftUI 后台重建主菜单崩溃(SIGABRT)。主线程调用则直通。
+    private func report(_ size: Int64, _ speed: Double) {
+        if Thread.isMainThread {
+            onSample(size, speed)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.onSample(size, speed)
+            }
+        }
+    }
+
+    /// 启动独立定时轮询(下载期间自动持续上报速度,不依赖 brew 输出)。
+    func start() {
+        guard timer == nil else { return }
+        let t = DispatchSource.makeTimerSource(queue: queue)
+        t.schedule(deadline: .now() + interval, repeating: interval)
+        t.setEventHandler { [weak self] in
+            _ = self?.sample()
+        }
+        t.resume()
+        timer = t
+    }
+
+    func stop() {
+        timer?.cancel()
+        timer = nil
     }
 }
 /// brew 数据层错误

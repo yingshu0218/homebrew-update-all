@@ -321,17 +321,19 @@ private struct PendingRow: View {
     }
 }
 
-/// 单个升级任务行:状态圆点 + 名称 + 进度条 + 速度/耗时
+/// 单个升级任务行:状态徽章 + 名称 + 进度条 + 大小/速度/耗时
 struct TaskRow: View {
     let task: PackageTask
 
     var body: some View {
         HStack(spacing: 10) {
-            statusDot
+            statusBadge
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(task.name)
                         .fontWeight(.medium)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                     Text(task.kind == .formula ? "formula" : "cask")
                         .font(.caption2)
                         .padding(.horizontal, 5)
@@ -339,24 +341,7 @@ struct TaskRow: View {
                         .background(.quaternary)
                         .clipShape(Capsule())
                 }
-                if task.status == .downloading || task.status == .installing {
-                    if task.status == .installing || !task.hasDeterminateProgress {
-                        ProgressView()
-                            .progressViewStyle(.linear)
-                            .tint(.teal)
-                            .frame(maxWidth: .infinity)
-                    } else {
-                        ProgressView(value: task.progress)
-                            .progressViewStyle(.linear)
-                            .tint(.blue)
-                            .animation(.linear(duration: 0.6), value: task.progress)
-                            .frame(maxWidth: .infinity)
-                    }
-                } else {
-                    Text(statusText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                progressOrStatus
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 2) {
@@ -364,9 +349,30 @@ struct TaskRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 if task.status == .downloading {
-                    Text(task.speedText)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    // 下载中:显示大小 + 速度
+                    if task.totalBytes > 0 {
+                        Text(task.progressDetailText)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(task.speedText)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    } else {
+                        Text(task.downloadedText)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Text(task.speedText)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                } else if task.status == .downloaded || task.status == .succeeded {
+                    if task.totalBytes > 0 {
+                        Text("\(task.downloadedText) · \(Int(task.progress * 100))%")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }
@@ -375,33 +381,79 @@ struct TaskRow: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    private var statusDot: some View {
-        Circle()
-            .fill(statusColor)
-            .frame(width: 9, height: 9)
+    /// 状态徽章:按阶段着色、淡入,比小圆点更直观(下载中/已下载待安装/安装中/完成/失败)
+    private var statusBadge: some View {
+        Text(task.statusDisplayText)
+            .font(.caption2.weight(.medium))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(badgeColor.opacity(0.15))
+            .foregroundStyle(badgeColor)
+            .clipShape(Capsule())
+            .frame(minWidth: 62)
+            .fixedSize()
     }
 
-    private var statusColor: Color {
+    private var badgeColor: Color {
         switch task.status {
         case .queued: return .gray
-        case .downloading, .installing: return .blue
+        case .downloading: return .blue
         case .downloaded: return .teal
+        case .installing: return .indigo
         case .succeeded: return .green
         case .failed, .timeout: return .red
         case .canceled: return .orange
         }
     }
 
-    private var statusText: String {
+    @ViewBuilder
+    private var progressOrStatus: some View {
         switch task.status {
-        case .queued: return "等待中"
-        case .downloading: return "下载中 \(task.downloadedText)"
-        case .downloaded: return "下载完成"
-        case .installing: return "安装中"
-        case .succeeded: return "成功"
-        case .failed(let reason): return "失败: \(reason)"
-        case .timeout: return "超时"
-        case .canceled: return "已取消"
+        case .downloading:
+            if task.hasDeterminateProgress {
+                ProgressView(value: task.progress)
+                    .progressViewStyle(.linear)
+                    .tint(.blue)
+                    .animation(.linear(duration: 0.3), value: task.progress)
+                    .frame(maxWidth: .infinity)
+            } else {
+                // 无法确定总量(总大小探测失败):不定进度条
+                ProgressView()
+                    .progressViewStyle(.linear)
+                    .tint(.blue)
+                    .frame(maxWidth: .infinity)
+            }
+        case .installing:
+            // 安装无法细粒度看进度,用不定进度条表示进行中
+            ProgressView()
+                .progressViewStyle(.linear)
+                .tint(.indigo)
+                .frame(maxWidth: .infinity)
+        case .queued:
+            Text("等待下载…")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .downloaded:
+            Text("等待安装(阶段 2 开始后自动执行)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .succeeded:
+            Text("安装完成")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .failed(let reason):
+            Text(reason)
+                .font(.caption)
+                .foregroundStyle(.red.opacity(0.9))
+                .lineLimit(1)
+        case .timeout:
+            Text("下载超时,已跳过")
+                .font(.caption)
+                .foregroundStyle(.red.opacity(0.9))
+        case .canceled:
+            Text("已取消")
+                .font(.caption)
+                .foregroundStyle(.orange)
         }
     }
 }

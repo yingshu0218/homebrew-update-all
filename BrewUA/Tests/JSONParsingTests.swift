@@ -170,4 +170,44 @@ final class JSONParsingTests: XCTestCase {
     func testInferMirrorUnknown() {
         XCTAssertEqual(EnvDetector.inferMirror(fromText: "没有相关配置"), .unknown)
     }
+
+    // MARK: - 下载 URL 提取与总大小探测
+
+    /// formula 的 info JSON 里 urls 数组优先
+    func testExtractDownloadURLFromFormula() {
+        let json = """
+        {"formulae":[{"name":"wget","urls":["https://mirror.example.com/wget.tar.gz"],"url":"https://fallback.example.com/wget.tar.gz"}],"casks":[]}
+        """
+        XCTAssertEqual(BrewService.extractDownloadURL(fromInfoJSON: json), "https://mirror.example.com/wget.tar.gz")
+    }
+
+    /// formula 无 urls 数组时回退 url 字段
+    func testExtractDownloadURLFromFormulaFallback() {
+        let json = """
+        {"formulae":[{"name":"wget","url":"https://fallback.example.com/wget.tar.gz"}],"casks":[]}
+        """
+        XCTAssertEqual(BrewService.extractDownloadURL(fromInfoJSON: json), "https://fallback.example.com/wget.tar.gz")
+    }
+
+    /// cask 的 info JSON 用 url 字段
+    func testExtractDownloadURLFromCask() {
+        let json = """
+        {"formulae":[],"casks":[{"token":"bambu-studio","url":"https://github.com/bambulab/BambuStudio/releases/download/v1/b.dmg"}]}
+        """
+        XCTAssertEqual(BrewService.extractDownloadURL(fromInfoJSON: json), "https://github.com/bambulab/BambuStudio/releases/download/v1/b.dmg")
+    }
+
+    /// cask 无顶层 url 时回退 artifacts 里的 url
+    func testExtractDownloadURLFromCaskArtifactsFallback() {
+        let json = """
+        {"formulae":[],"casks":[{"token":"some-app","url":null,"artifacts":[{"url":"https://a.example.com/some.dmg"}]}]}
+        """
+        XCTAssertEqual(BrewService.extractDownloadURL(fromInfoJSON: json), "https://a.example.com/some.dmg")
+    }
+
+    /// 无任何 URL 信息返回 nil
+    func testExtractDownloadURLNil() {
+        let json = #"{"formulae":[],"casks":[]}"#
+        XCTAssertNil(BrewService.extractDownloadURL(fromInfoJSON: json))
+    }
 }
