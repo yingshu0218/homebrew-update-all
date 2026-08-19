@@ -1,0 +1,147 @@
+import XCTest
+
+/// 针对真实 brew 命令输出格式的解析回归测试。
+/// 这些格式是 M2/M3 数据层的根基,必须锁定。
+final class JSONParsingTests: XCTestCase {
+
+    /// 真实 brew outdated --formula --json 输出(单对象 snake_case)
+    func testParseOutdatedFormulaJSON() {
+        let json = """
+        {
+          "formulae": [
+            {
+              "name": "yingshu0218/update-all/brew-update-all",
+              "installed_versions": ["1.8.6"],
+              "current_version": "1.8.6",
+              "pinned": false,
+              "pinned_version": null
+            }
+          ],
+          "casks": []
+        }
+        """
+        let entries = BrewService.parseOutdatedJSON(json, kind: .formula)
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries[0].name, "yingshu0218/update-all/brew-update-all")
+        XCTAssertEqual(entries[0].currentVersion, "1.8.6")
+        XCTAssertEqual(entries[0].newestVersion, "1.8.6")
+        XCTAssertEqual(entries[0].kind, .formula)
+    }
+
+    /// 真实 brew outdated --cask --json 输出(cask 带 installed_versions)
+    func testParseOutdatedCaskJSON() {
+        let json = """
+        {
+          "formulae": [],
+          "casks": [
+            {
+              "name": "bambu-studio",
+              "installed_versions": ["02.07.01.62,20260616174358"],
+              "current_version": "02.08.02.60,20260814163036",
+              "pinned": false,
+              "pinned_version": null
+            }
+          ]
+        }
+        """
+        let entries = BrewService.parseOutdatedJSON(json, kind: .cask)
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries[0].name, "bambu-studio")
+        XCTAssertEqual(entries[0].currentVersion, "02.07.01.62,20260616174358")
+        // 注意 cask 版本带逗号后缀,这是我们保留原样的现实
+        XCTAssertEqual(entries[0].newestVersion, "02.08.02.60,20260814163036")
+    }
+
+    /// 首行可能是 API 下载警告,必须能用最后一行 JSON 兜底
+    func testParseOutdatedWithLeadingGarbage() {
+        let json = """
+        ==> Downloading Homebrew API data
+        ✔︎ JSON API packages.arm64.json
+        {"formulae":[{"name":"wget","installed_versions":["1.24.5"],"current_version":"1.25.0"}],"casks":[]}
+        """
+        let entries = BrewService.parseOutdatedJSON(json, kind: .formula)
+        XCTAssertEqual(entries.count, 1)
+        XCTAssertEqual(entries[0].name, "wget")
+    }
+
+    /// 空结果也必须解析成功(返回 [])
+    func testParseEmptyOutdated() {
+        let json = #"{"formulae":[],"casks":[]}"#
+        XCTAssertEqual(BrewService.parseOutdatedJSON(json, kind: .formula).count, 0)
+        XCTAssertEqual(BrewService.parseOutdatedJSON(json, kind: .cask).count, 0)
+    }
+
+    /// brew tap-info --json 无参返回 [] 时,tap remote 应从文件系统收集
+    func testTapInfoEmptyJSONDoesNotBreak() {
+        // 这不报错即可,收集逻辑走 filesystem 通道
+        let remotes = EnvDetector.collectTapRemotes(prefix: "/nonexistent-path")
+        XCTAssertTrue(remotes.isEmpty)
+    }
+
+    /// 真实 brew list --formula --versions --json(6.0.x 实测格式)
+    func testParseInstalledFormulaJSON() {
+        let json = """
+        {"formulae":[{"name":"autoconf","versions":["2.73"],"linked_version":"2.73","optlinked_version":"2.73","pinned_version":null},{"name":"bat","versions":["0.26.1"],"linked_version":"0.26.1","optlinked_version":"0.26.1","pinned_version":null}],"casks":[]}
+        """
+        let list = BrewService.parseInstalledList(json, kind: .formula)
+        XCTAssertEqual(list.count, 2)
+        XCTAssertEqual(list[0].name, "autoconf")
+        XCTAssertEqual(list[0].version, "2.73")
+        XCTAssertEqual(list[0].kind, .formula)
+        XCTAssertFalse(list[0].isPinned)
+    }
+
+    /// 真实 brew list --cask --versions --json(cask 用 token 字段,注意不是 name)
+    func testParseInstalledCaskJSONUsesToken() {
+        let json = """
+        {"formulae":[],"casks":[{"token":"ace-studio","versions":["2.1.3,2202"],"pinned_version":null},{"token":"arduino-ide","versions":["2.3.10"],"pinned_version":null}]}
+        """
+        let list = BrewService.parseInstalledList(json, kind: .cask)
+        XCTAssertEqual(list.count, 2)
+        XCTAssertEqual(list[0].name, "ace-studio")
+        XCTAssertEqual(list[0].version, "2.1.3,2202")
+        XCTAssertEqual(list[0].kind, .cask)
+        // 带逗号后缀是 cask 版本现实
+    }
+
+    /// 解析 brew services list 的表格输出
+    func testParseServicesOutput() {
+        let out = """
+        Name        Status    User  File
+        mysql       started   user  ~/Library/LaunchAgents/homebrew.mxcl.mysql.plist
+        redis       stopped   user  ~/Library/LaunchAgents/homebrew.mxcl.redis.plist
+        """
+        let services = BrewService.parseServicesOutput(out)
+        XCTAssertEqual(services.count, 2)
+        XCTAssertEqual(services[0].name, "mysql")
+        XCTAssertTrue(services[0].isRunning)
+        XCTAssertEqual(services[1].name, "redis")
+        XCTAssertFalse(services[1].isRunning)
+    }
+
+    /// 真实 brew list 前常带 API 警告行,必须是整段解析失败后再逐行兜底(多行 JSON 也要能解析)
+    func testParseInstalledListWithLeadingGarbageMultiline() {
+        let json = """
+        ==> Downloading Homebrew API data
+        ✔︎ JSON API packages.arm64.json
+
+        {
+          "formulae": [
+            {"name": "wget", "versions": ["1.25.0"], "linked_version": "1.25.0", "pinned_version": null}
+          ],
+          "casks": []
+        }
+        """
+        let list = BrewService.parseInstalledList(json, kind: .formula)
+        XCTAssertEqual(list.count, 1)
+        XCTAssertEqual(list[0].name, "wget")
+        XCTAssertEqual(list[0].version, "1.25.0")
+    }
+
+    /// 空 JSON 是合法结果(没装包),不是失败
+    func testParseInstalledListEmptyIsValid() {
+        let json = #"{"formulae":[],"casks":[]}"#
+        let list = BrewService.parseInstalledList(json, kind: .formula)
+        XCTAssertTrue(list.isEmpty)
+    }
+}
