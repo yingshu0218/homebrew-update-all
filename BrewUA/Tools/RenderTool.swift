@@ -6,6 +6,7 @@ import AppKit
 
 @main
 struct RenderTool {
+    @MainActor
     static func main() async {
         // 初始化 AppKit + 创建可见窗口(不 orderFront,仅用于离屏渲染管线)
         _ = NSApplication.shared
