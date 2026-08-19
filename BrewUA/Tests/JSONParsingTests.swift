@@ -144,4 +144,30 @@ final class JSONParsingTests: XCTestCase {
         let list = BrewService.parseInstalledList(json, kind: .formula)
         XCTAssertTrue(list.isEmpty)
     }
+
+    // MARK: - 镜像源检测
+
+    func testInferMirrorUSTC() {
+        let text = "HOMEBREW_API_DOMAIN=https://mirrors.ustc.edu.cn/homebrew-bottles/api"
+        XCTAssertEqual(EnvDetector.inferMirror(fromText: text), .ustc)
+    }
+
+    func testInferMirrorTsinghua() {
+        let text = "export HOMEBREW_API_DOMAIN=https://mirrors.tuna.tsinghua.edu.cn/homebrew-bottles/api"
+        XCTAssertEqual(EnvDetector.inferMirror(fromText: text), .tsinghua)
+    }
+
+    func testInferMirrorAliyun() {
+        let text = "HOMEBREW_API_DOMAIN=https://mirrors.aliyun.com/homebrew-bottles/api"
+        XCTAssertEqual(EnvDetector.inferMirror(fromText: text), .aliyun)
+    }
+
+    func testInferMirrorOfficial() {
+        let text = "https://github.com/Homebrew/brew"
+        XCTAssertEqual(EnvDetector.inferMirror(fromText: text), .official)
+    }
+
+    func testInferMirrorUnknown() {
+        XCTAssertEqual(EnvDetector.inferMirror(fromText: "没有相关配置"), .unknown)
+    }
 }

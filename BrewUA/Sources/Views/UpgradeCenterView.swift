@@ -1,32 +1,47 @@
 import SwiftUI
 
-/// 升级中心:展示两阶段升级的实时进度、速度、失败隔离与摘要。
+/// 升级中心:应用商店式体验——先"检查更新"得到待更新清单(可勾选),再"更新所选/全部更新"执行两阶段升级。
+/// 运行中展示任务进度、速度、失败隔离与摘要。
 struct UpgradeCenterView: View {
     @EnvironmentObject private var engine: UpdateEngine
+
+    /// 勾选状态:包名 → 是否选中
+    @State private var selectedNames: Set<String> = []
+    @State private var greedy = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             header
             Divider()
 
-            if engine.isRunning || !engine.tasks.isEmpty {
+            if engine.isRunning || engine.tasks.isEmpty == false {
                 taskListView
                 if let s = engine.summary {
                     summaryView(s)
                 }
                 logSection
+            } else if !engine.pendingUpdates.isEmpty {
+                // 应用商店式阶段:待更新清单(可勾选)
+                pendingListView
+                actionBar
             } else {
                 ContentUnavailableView(
-                    "尚无升级记录",
+                    "尚无更新记录",
                     systemImage: "arrow.triangle.2.circlepath",
-                    description: Text("点击「检查更新」开始两阶段升级(下载→安装,失败自动隔离)。")
+                    description: Text("先点击「检查更新」拉取最新待更新清单,再选择要更新的包。")
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onChange(of: engine.pendingUpdates.count) { _ in
+            // 清单刷新时重置勾选(避免残留旧勾选)
+            selectedNames = Set(engine.pendingUpdates.map(\.name))
+        }
     }
+
+    // MARK: - Header
 
     private var header: some View {
         HStack {
@@ -45,15 +60,33 @@ struct UpgradeCenterView: View {
                 Button("取消") {
                     engine.cancel()
                 }
-                .disabled(!engine.isRunning)
-            } else if engine.tasks.isEmpty {
+            } else if engine.pendingUpdates.isEmpty && engine.tasks.isEmpty {
+                // 尚未检测 / 已清空
+                Toggle("包含自更新应用", isOn: $greedy)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
                 Button {
-                    engine.start()
+                    engine.checkOnly(options: UpdateOptions(greedy: greedy))
                 } label: {
-                    Label("检查更新", systemImage: "arrow.triangle.2.circlepath")
+                    Label("检查更新", systemImage: "magnifyingglass")
+                }
+            } else if !engine.pendingUpdates.isEmpty {
+                // 有清单但未运行 → 可再次检查、清空
+                Toggle("包含自更新应用", isOn: $greedy)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+                Button {
+                    engine.checkOnly(options: UpdateOptions(greedy: greedy))
+                } label: {
+                    Label("检查更新", systemImage: "magnifyingglass")
+                }
+                Button(role: .destructive) {
+                    engine.reset()
+                } label: {
+                    Label("清空", systemImage: "trash")
                 }
             } else {
-                // 运行结束:重试失败 + 再次检查
+                // 运行结束:重试失败 + 再次检查 + 清空
                 if engine.failedCount > 0 {
                     Button {
                         engine.retryFailed()
@@ -62,9 +95,9 @@ struct UpgradeCenterView: View {
                     }
                 }
                 Button {
-                    engine.start()
+                    engine.checkOnly(options: UpdateOptions(greedy: greedy))
                 } label: {
-                    Label("再次检查", systemImage: "arrow.triangle.2.circlepath")
+                    Label("再次检查", systemImage: "magnifyingglass")
                 }
                 Button(role: .destructive) {
                     engine.reset()
@@ -75,6 +108,91 @@ struct UpgradeCenterView: View {
         }
     }
 
+    // MARK: - 待更新清单(应用商店式)
+
+    private var pendingListView: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Toggle("", isOn: allSelectedBinding)
+                    .toggleStyle(.checkbox)
+                    .labelsHidden()
+                    .help("全选/取消全选")
+                Text("待更新包 (\(engine.pendingUpdates.count))")
+                    .font(.headline)
+                Spacer()
+                Text("已选择 \(selectedNames.count)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 4)
+
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    ForEach(engine.pendingUpdates) { entry in
+                        PendingRow(
+                            entry: entry,
+                            isSelected: selectedNames.contains(entry.name),
+                            onToggle: { toggleSelection(entry.name) }
+                        )
+                    }
+                }
+                .padding(2)
+            }
+            .frame(maxHeight: .infinity)
+            .background(.quaternary.opacity(0.15))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .frame(maxHeight: .infinity)
+    }
+
+    private var allSelectedBinding: Binding<Bool> {
+        Binding(
+            get: {
+                !engine.pendingUpdates.isEmpty && selectedNames.count == engine.pendingUpdates.count
+            },
+            set: { on in
+                if on {
+                    selectedNames = Set(engine.pendingUpdates.map(\.name))
+                } else {
+                    selectedNames = []
+                }
+            }
+        )
+    }
+
+    private func toggleSelection(_ name: String) {
+        if selectedNames.contains(name) {
+            selectedNames.remove(name)
+        } else {
+            selectedNames.insert(name)
+        }
+    }
+
+    /// 底部操作条:"更新所选 (N)" + "全部更新"
+    private var actionBar: some View {
+        HStack(spacing: 12) {
+            let selected = engine.pendingUpdates.filter { selectedNames.contains($0.name) }
+            Button {
+                engine.upgrade(packages: selected, options: UpdateOptions(greedy: greedy))
+            } label: {
+                Label("更新所选 (\(selected.count))", systemImage: "arrow.down.circle")
+            }
+            .disabled(selected.isEmpty)
+            .help(selected.isEmpty ? "请先勾选要更新的包" : "两阶段升级所选的包")
+
+            Button {
+                engine.start(options: UpdateOptions(greedy: greedy))
+            } label: {
+                Label("全部更新", systemImage: "arrow.triangle.2.circlepath")
+            }
+
+            Spacer()
+        }
+        .padding(.top, 4)
+    }
+
+    // MARK: - 任务列表/摘要/日志(运行中+结束后,复用原逻辑)
+
     private var taskListView: some View {
         ScrollView {
             LazyVStack(spacing: 6) {
@@ -84,7 +202,6 @@ struct UpgradeCenterView: View {
             }
             .padding(2)
         }
-        // 任务列表随内容伸缩,但让出 summary/日志的空间
         .frame(maxHeight: .infinity)
         .frame(minHeight: 0)
     }
@@ -127,7 +244,6 @@ struct UpgradeCenterView: View {
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        // 底部锚点:有新日志时自动滚动到这里
                         Color.clear.frame(height: 1).id("log-bottom")
                     }
                     .padding(8)
@@ -153,6 +269,53 @@ struct UpgradeCenterView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+    }
+}
+
+/// 待更新清单中的一行包
+private struct PendingRow: View {
+    let entry: OutdatedEntry
+    let isSelected: Bool
+    let onToggle: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Toggle("", isOn: Binding(get: { isSelected }, set: { _ in onToggle() }))
+                .toggleStyle(.checkbox)
+                .labelsHidden()
+
+            Image(systemName: entry.kind == .formula ? "shippingbox" : "app.badge")
+                .foregroundStyle(entry.kind == .formula ? .blue : .purple)
+                .frame(width: 18)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(entry.name)
+                        .font(.body.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(entry.kind == .formula ? "formula" : "cask")
+                        .font(.caption2)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(entry.kind == .formula ? Color.blue.opacity(0.15) : Color.purple.opacity(0.15))
+                        .foregroundStyle(entry.kind == .formula ? Color.blue : Color.purple)
+                        .clipShape(Capsule())
+                }
+                HStack(spacing: 6) {
+                    Text(entry.displayVersion)
+                        .font(.caption)
+                        .foregroundStyle(.primary)
+                }
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(isSelected ? Color.accentColor.opacity(0.1) : Color.clear)
+        .contentShape(Rectangle())
+        .onTapGesture { onToggle() }
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }
 

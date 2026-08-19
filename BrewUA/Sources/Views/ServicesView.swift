@@ -69,10 +69,11 @@ struct ServicesView: View {
         errorMessage = nil
         defer { isLoading = false }
         let result = await brew.servicesList()
-        if result.isEmpty {
+        if !result.success {
             errorMessage = "未能读取服务列表。请确认 brew services 可用。"
         } else {
-            services = result
+            services = result.services
+            // 成功但无服务:走"没有 brew services"空状态(不是错误)
         }
     }
 

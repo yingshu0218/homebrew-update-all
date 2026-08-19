@@ -55,9 +55,16 @@ final class StreamedProcess {
     convenience init(brewArguments: [String], environment: [String: String] = StreamedProcess.brewEnv) {
         // 用 python3 setsid 包装成会话领导者,使 brew 及子孙进程同组,可整组 kill
         // (等价 zsh 源的 os.setsid() 包装;GUI 无法保证 Process 有 processGroup 属性)
+        //
+        // setsid 不是硬依赖:部分环境(以 responsibility 进程 / GUI app 启动的子进程)
+        // 会抛 PermissionError: Operation not permitted。此时降级为直接 execv,
+        // 命令照常执行,仅"整组终止"能力降级(见 run() 的 kill 兜底)。
         let runner = """
         import os, sys
-        os.setsid()
+        try:
+            os.setsid()
+        except OSError:
+            pass
         os.execv(sys.argv[1], sys.argv[1:])
         """
         let brewPath = StreamedProcess.brewExecutablePath()
@@ -128,11 +135,18 @@ final class StreamedProcess {
             continuation.onTermination = { @Sendable _ in
                 let pid = p.processIdentifier
                 if pid > 0 {
-                    kill(-pid, SIGTERM)
+                    // setsid 成功时子进程是新会话组长,-pid 可整组终止;
+                    // setsid 被拒时子进程在原进程组,组终止会 EPERM,降级杀主进程。
+                    let groupKilled = kill(-pid, SIGTERM) == 0
+                    if !groupKilled {
+                        kill(pid, SIGTERM)
+                    }
                     // 给进程 2 秒从容退出,再强杀
                     DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
                         if p.isRunning {
-                            kill(-pid, SIGKILL)
+                            if kill(-pid, SIGKILL) != 0 {
+                                kill(pid, SIGKILL)
+                            }
                         }
                     }
                 }

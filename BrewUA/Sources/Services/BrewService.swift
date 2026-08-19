@@ -176,13 +176,17 @@ final class BrewService {
         await installedAllWithStatus().packages
     }
 
-    /// 总览页聚合统计:已安装 formula/cask 数 + 待更新数(串行避免 brew 互锁)。
-    func overviewStats() async -> (installedFormulae: Int, installedCasks: Int, outdated: Int) {
+    /// 总览页聚合统计:已安装 formula/cask 数 + 待更新 formula/cask 数(串行避免 brew 互锁)。
+    func overviewStats() async -> (installedFormulae: Int, installedCasks: Int, outdatedFormulae: Int, outdatedCasks: Int) {
         let packages = await installedAll()
-        let outdatedList = await outdatedAll(greedy: false)
+        let ignored = config.loadIgnored()
+        let outdatedF = await outdatedFormulae()
+        let outdatedC = await outdatedCasks(greedy: false)
         let formulae = packages.filter { $0.kind == .formula }.count
         let casks = packages.filter { $0.kind == .cask }.count
-        return (formulae, casks, outdatedList.count)
+        let outdatedFormulae = outdatedF.filter { !ignored.contains($0.name) }.count
+        let outdatedCasks = outdatedC.filter { !ignored.contains($0.name) }.count
+        return (formulae, casks, outdatedFormulae, outdatedCasks)
     }
 
     /// 解析 `brew list --json` 输出。
@@ -236,9 +240,12 @@ final class BrewService {
     }
 
     /// brew services list(服务管理页)
-    func servicesList() async -> [ServiceInfo] {
-        guard let out = try? await runSerialized(["services", "list"]) else { return [] }
-        return Self.parseServicesOutput(out)
+    /// - Returns: (services, 是否读取成功)。命令失败置 false;成功但无服务时 services 为空、success 仍为 true。
+    func servicesList() async -> (services: [ServiceInfo], success: Bool) {
+        guard let out = try? await runSerialized(["services", "list"]) else {
+            return ([], false)
+        }
+        return (Self.parseServicesOutput(out), true)
     }
 
     /// 解析 brew services list 的非 JSON 表格输出(兼容性最强)

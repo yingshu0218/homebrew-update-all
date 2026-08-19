@@ -52,15 +52,66 @@ enum EnvDetector {
             netOK = true
         }
 
+        // 镜像源检测:多来源汇总(见 inferMirror)。GUI 由 LaunchServices 启动不继承 shell
+        // export,所以除进程环境变量外,还需读用户 shell 配置里的 HOMEBREW_*。
+        let envText = ProcessInfo.processInfo.environment
+            .filter { $0.key.hasPrefix("HOMEBREW_") }
+            .values
+            .joined(separator: " ")
+        let shellText = readShellBrewEnv()
+        let brewConfigText = (try? await StreamedProcess(brewArguments: ["config"]).runSync()) ?? ""
+        let mergedMirrorText = envText + " " + shellText + " " + brewConfigText + " " + tapRemotes.values.joined(separator: " ")
+
         return EnvironmentInfo(
             brewPath: path,
             brewVersion: version,
             prefix: prefix,
-            mirrorSource: inferMirror(from: tapRemotes, country: country),
+            mirrorSource: inferMirror(fromText: mergedMirrorText),
             tapRemotes: tapRemotes,
             networkCountry: country,
             isNetworkOk: netOK
         )
+    }
+
+    // MARK: - 镜像源检测
+
+    /// 从用户 shell 配置(~/.zprofile / ~/.zshrc / ~/.bash_profile / ~/.bashrc)
+    /// 中收集 `HOMEBREW_*` 镜像源环境变量配置。GUI 进程不继承 shell export,
+    /// 直接读文件是最可靠的跨环境方式。
+    static func readShellBrewEnv() -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let files = [".zprofile", ".zshrc", ".bash_profile", ".bashrc"]
+            .map { home + "/" + $0 }
+        var hits: [String] = []
+        for file in files where FileManager.default.isReadableFile(atPath: file) {
+            guard let content = try? String(contentsOfFile: file, encoding: .utf8) else { continue }
+            for line in content.components(separatedBy: .newlines) where line.contains("HOMEBREW_") {
+                // 提取形如 export HOMEBREW_X="url" / export HOMEBREW_X=url 的值
+                let cleaned = line
+                    .replacingOccurrences(of: "export", with: "")
+                    .replacingOccurrences(of: "\"", with: "")
+                    .trimmingCharacters(in: .whitespaces)
+                if let eq = cleaned.firstIndex(of: "=") {
+                    let key = cleaned[..<eq].trimmingCharacters(in: .whitespaces)
+                    let value = cleaned[cleaned.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+                    if key.hasPrefix("HOMEBREW_"), !value.isEmpty {
+                        hits.append(value)
+                    }
+                }
+            }
+        }
+        return hits.joined(separator: " ")
+    }
+
+    /// 通过汇总文本推断当前镜像源。汇总内容包含:
+    /// 进程 HOMEBREW_* 环境变量 / shell 配置 / brew config 输出 / tap remote。
+    static func inferMirror(fromText text: String) -> MirrorSource {
+        if text.contains("mirrors.ustc.edu.cn") { return .ustc }
+        if text.contains("mirrors.tuna.tsinghua.edu.cn") || text.contains("mirrors.tuna") { return .tsinghua }
+        if text.contains("mirrors.aliyun.com") { return .aliyun }
+        if text.contains("github.com/Homebrew") || text.contains("github.com/homebrew") { return .official }
+        // 兜底:多个第三方 tap 都指 github 但无 Homebrew 官方 tap 时,不能断定用了官方源
+        return .unknown
     }
 
     // MARK: - tap 远程收集
@@ -120,16 +171,6 @@ enum EnvDetector {
             }
         }
         return ""
-    }
-
-    /// 通过 remote URL 推断当前镜像源
-    static func inferMirror(from taps: [String: String], country: String) -> MirrorSource {
-        let joined = taps.values.joined(separator: " ")
-        if joined.contains("mirrors.ustc.edu.cn") { return .ustc }
-        if joined.contains("mirrors.tuna.tsinghua.edu.cn") || joined.contains("mirrors.tuna") { return .tsinghua }
-        if joined.contains("mirrors.aliyun.com") { return .aliyun }
-        if joined.contains("github.com/Homebrew") || joined.contains("github.com/homebrew") { return .official }
-        return .unknown
     }
 
     private static func fetchCountry() async throws -> String {

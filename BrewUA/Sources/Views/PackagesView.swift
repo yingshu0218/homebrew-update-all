@@ -4,6 +4,8 @@ import SwiftUI
 struct PackagesView: View {
     private let brew = BrewService.shared
     private let config = ConfigService.shared
+    @EnvironmentObject private var engine: UpdateEngine
+    @EnvironmentObject private var appModel: AppModel
     @State private var packages: [InstalledPackage] = []
     @State private var isLoading = false
     @State private var searchText = ""
@@ -93,6 +95,7 @@ struct PackagesView: View {
                     package: pkg,
                     isIgnored: ignoredNames.contains(pkg.name),
                     onIgnore: { toggleIgnore(pkg) },
+                    onUpgrade: { upgrade(pkg) },
                     onUninstall: { uninstall(pkg) }
                 )
             }
@@ -148,6 +151,19 @@ struct PackagesView: View {
             await load()
         }
     }
+
+    /// 单包升级:仅升级这一个包(两阶段),并跳转会升级中心看进度
+    private func upgrade(_ pkg: InstalledPackage) {
+        let entry = OutdatedEntry(
+            name: pkg.name,
+            currentVersion: pkg.version,
+            newestVersion: "?",
+            kind: pkg.kind,
+            isIgnored: false
+        )
+        engine.upgrade(packages: [entry])
+        appModel.selectedSection = .upgrade
+    }
 }
 
 /// 单行包
@@ -155,6 +171,7 @@ private struct PackageRow: View {
     let package: InstalledPackage
     let isIgnored: Bool
     let onIgnore: () -> Void
+    let onUpgrade: () -> Void
     let onUninstall: () -> Void
     @State private var confirmUninstall = false
 
@@ -195,6 +212,14 @@ private struct PackageRow: View {
             }
 
             Spacer()
+
+            Button {
+                onUpgrade()
+            } label: {
+                Image(systemName: "arrow.down.circle")
+            }
+            .buttonStyle(.borderless)
+            .help("升级 \(package.name)")
 
             Button {
                 onIgnore()

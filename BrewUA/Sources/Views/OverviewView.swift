@@ -67,7 +67,7 @@ struct OverviewView: View {
                     .foregroundStyle(.secondary)
             }
             metricCard("待更新", "\(appModel.outdatedCount)", icon: "arrow.triangle.2.circlepath", tint: appModel.outdatedCount > 0 ? .orange : .teal) {
-                Text("已安装 \(appModel.installedFormulaCount + appModel.installedCaskCount) 个包")
+                Text("formulae \(appModel.outdatedFormulaCount) · casks \(appModel.outdatedCaskCount) · 已安装 \(appModel.installedFormulaCount + appModel.installedCaskCount) 个包")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             } onTap: {
@@ -112,7 +112,13 @@ struct OverviewView: View {
 
     private var quickActions: some View {
         HStack(spacing: 12) {
-            actionCard("检查更新", systemImage: "arrow.triangle.2.circlepath", tint: .blue) {
+            actionCard("检查更新", systemImage: "magnifyingglass", tint: .blue) {
+                // 仅检测:拉取待更新清单并跳到升级中心,由用户决定更哪些
+                appModel.selectedSection = .upgrade
+                engine.checkOnly()
+            }
+            actionCard("全部升级", systemImage: "arrow.triangle.2.circlepath", tint: .teal) {
+                // 一键升级全部待更新(等价 CLI 的 auto 模式)
                 appModel.selectedSection = .upgrade
                 engine.start()
             }
@@ -152,7 +158,9 @@ struct OverviewView: View {
                 self.appModel.brewVersion = env.brewVersion
                 self.appModel.installedFormulaCount = stat.installedFormulae
                 self.appModel.installedCaskCount = stat.installedCasks
-                self.appModel.outdatedCount = stat.outdated
+                self.appModel.outdatedCount = stat.outdatedFormulae + stat.outdatedCasks
+                self.appModel.outdatedFormulaCount = stat.outdatedFormulae
+                self.appModel.outdatedCaskCount = stat.outdatedCasks
                 self.isLoading = false
             }
         }

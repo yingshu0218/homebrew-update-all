@@ -9,6 +9,9 @@ final class AppModel: ObservableObject {
     @Published var installedCaskCount: Int = 0
     /// 待更新数量,由 BrewService 刷新
     @Published var outdatedCount: Int = 0
+    /// 待更新明细计数(formula/cask 分开),由 BrewService 刷新
+    @Published var outdatedFormulaCount: Int = 0
+    @Published var outdatedCaskCount: Int = 0
     /// 环境信息
     @Published var brewPrefix: String = ""
     @Published var brewVersion: String = ""
