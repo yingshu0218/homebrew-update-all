@@ -31,6 +31,10 @@ final class BrewService {
     // MARK: - brew update
 
     /// 更新源和包信息。流式输出行到闭包。
+    /// @MainActor:onLine 闭包的调用点强制在主线程。
+    /// 若不隔离,AsyncThrowingStream 的 for-await 恢复点在后台线程执行,
+    /// 回调改 @Published 会触发 SwiftUI 后台重建主菜单崩溃(SIGABRT)。
+    @MainActor
     func update(onLine: @escaping (String) -> Void) async throws {
         let proc = StreamedProcess(brewArguments: ["update"])
         for try await event in proc.run() {
@@ -108,6 +112,9 @@ final class BrewService {
 
     /// 阶段1:下载单个包(流式,带进度事件)。
     /// - `onProgress`: 收到 progress 帧(每秒若干次)时回调,含已下载/总量/速度
+    /// - @MainActor:与 update 同理,保证 onLine/onProgress 在主线程执行,
+    ///   避免后台 stream 恢复点改 @Published 触发 SIGABRT
+    @MainActor
     func fetch(package: OutdatedEntry, onLine: @escaping (String) -> Void, onProgress: @escaping (Int64, Int64, Double) -> Void) async throws {
         let flag = package.kind == .formula ? "--formula" : "--cask"
         let proc = StreamedProcess(brewArguments: ["fetch", flag, package.name])
@@ -139,6 +146,8 @@ final class BrewService {
     }
 
     /// 阶段2:安装单个包。formula 走 upgrade,cask 走 reinstall(复刻 brew-ua 分支)
+    /// @MainActor:同理,onLine 在主线程执行
+    @MainActor
     func install(package: OutdatedEntry, onLine: @escaping (String) -> Void) async throws {
         if package.kind == .formula {
             let proc = StreamedProcess(brewArguments: ["upgrade", "--formula", package.name])

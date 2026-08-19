@@ -168,7 +168,7 @@ struct UpgradeCenterView: View {
         }
     }
 
-    /// 底部操作条:"更新所选 (N)" + "全部更新"
+    /// 底部操作条:"更新所选 (N)" + "全部更新"(绿色边框显眼样式)
     private var actionBar: some View {
         HStack(spacing: 12) {
             let selected = engine.pendingUpdates.filter { selectedNames.contains($0.name) }
@@ -177,6 +177,7 @@ struct UpgradeCenterView: View {
             } label: {
                 Label("更新所选 (\(selected.count))", systemImage: "arrow.down.circle")
             }
+            .buttonStyle(MainActionButtonStyle())
             .disabled(selected.isEmpty)
             .help(selected.isEmpty ? "请先勾选要更新的包" : "两阶段升级所选的包")
 
@@ -185,6 +186,7 @@ struct UpgradeCenterView: View {
             } label: {
                 Label("全部更新", systemImage: "arrow.triangle.2.circlepath")
             }
+            .buttonStyle(MainActionButtonStyle())
 
             Spacer()
         }
@@ -401,5 +403,31 @@ struct TaskRow: View {
         case .timeout: return "超时"
         case .canceled: return "已取消"
         }
+    }
+}
+
+/// 主操作按钮样式:绿色实线边框 + 绿色文字,悬停浅绿底,视觉上突出"执行更新"。
+/// 区别于系统默认边框色,让用户一眼找到关键动作。
+private struct MainActionButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.body.weight(.medium))
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .foregroundStyle(Color.green.opacity(isEnabled ? 1 : 0.4))
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(configuration.isPressed
+                        ? Color.green.opacity(0.22)
+                        : Color.green.opacity(isEnabled ? 0.08 : 0.02))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.green.opacity(isEnabled ? (configuration.isPressed ? 0.6 : 0.9) : 0.3), lineWidth: 1.5)
+            )
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }

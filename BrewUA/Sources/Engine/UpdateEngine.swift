@@ -124,9 +124,18 @@ final class UpdateEngine: ObservableObject {
         appendLog("用户请求取消…")
     }
 
-    /// 追加一条运行日志。类本身是 @MainActor,所有调用点都在主线程,直接同步追加。
+    /// 追加一条运行日志。类本身是 @MainActor,但 closure 回调路径
+    /// (BrewService.fetch/install/update 的 onLine 在后台 stream 恢复点执行)
+    /// 可能从后台线程进来,必须切回主线程再改 @Published,否则触发
+    /// SwiftUI 后台重建主菜单崩溃(SIGABRT)。
     func appendLog(_ line: String) {
-        eventLog.append(line)
+        if Thread.isMainThread {
+            eventLog.append(line)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.eventLog.append(line)
+            }
+        }
     }
 
     /// 升级后清理:移除已不在待更新清单里且已成功/取消的包。
