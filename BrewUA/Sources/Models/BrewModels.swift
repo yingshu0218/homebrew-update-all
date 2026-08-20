@@ -35,6 +35,8 @@ struct OutdatedEntry: Identifiable, Hashable {
     let newestVersion: String
     let kind: PackageKind
     var isIgnored: Bool
+    /// 是否自更新应用(cask 的 auto_updates 字段;formula/未知时 nil)
+    var autoUpdates: Bool?
 
     var displayVersion: String {
         "\(currentVersion) → \(newestVersion)"

@@ -210,4 +210,31 @@ final class JSONParsingTests: XCTestCase {
         let json = #"{"formulae":[],"casks":[]}"#
         XCTAssertNil(BrewService.extractDownloadURL(fromInfoJSON: json))
     }
+
+    // MARK: - cask auto_updates 解析
+
+    /// 批量 info JSON:auto_updates true/false 都正确映射
+    func testParseCaskAutoUpdatesMixed() {
+        let json = """
+        {"formulae":[],"casks":[{"token":"google-chrome","auto_updates":true},{"token":"bambu-studio","auto_updates":false}]}
+        """
+        let flags = BrewService.parseCaskAutoUpdates(fromInfoJSON: json)
+        XCTAssertEqual(flags["google-chrome"], true)
+        XCTAssertEqual(flags["bambu-studio"], false)
+        XCTAssertEqual(flags.count, 2)
+    }
+
+    /// 缺失 auto_updates 字段的 cask 不出现在结果里(不误报 false)
+    func testParseCaskAutoUpdatesMissingFieldIgnored() {
+        let json = """
+        {"formulae":[],"casks":[{"token":"plain-app"}]}
+        """
+        let flags = BrewService.parseCaskAutoUpdates(fromInfoJSON: json)
+        XCTAssertTrue(flags.isEmpty)
+    }
+
+    /// 空 JSON 返回空字典
+    func testParseCaskAutoUpdatesEmpty() {
+        XCTAssertTrue(BrewService.parseCaskAutoUpdates(fromInfoJSON: #"{"formulae":[],"casks":[]}"#).isEmpty)
+    }
 }

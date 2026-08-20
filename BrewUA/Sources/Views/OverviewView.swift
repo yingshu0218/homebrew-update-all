@@ -10,19 +10,22 @@ struct OverviewView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             header
-            if let envInfo {
-                environmentCards(envInfo)
-            } else if isLoading {
-                ProgressView("正在检测环境…")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                Button("开始环境检测") {
-                    refresh()
+            // 三态状态区统一固定高度槽位:加载前/加载中/加载后 quickActions 位置不变
+            Group {
+                if let envInfo {
+                    environmentCards(envInfo)
+                } else if isLoading {
+                    ProgressView("正在检测环境…")
+                        .frame(maxWidth: .infinity, alignment: .center)
+                } else {
+                    Button("开始环境检测") {
+                        refresh()
+                    }
+                    .frame(maxWidth: .infinity, alignment: .center)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             }
+            .frame(minHeight: 216, maxHeight: .infinity, alignment: .top)
             quickActions
-            Spacer(minLength: 0)
         }
         .padding(20)
         .task { refresh() }

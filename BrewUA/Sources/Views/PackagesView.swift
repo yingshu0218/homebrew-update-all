@@ -12,6 +12,8 @@ struct PackagesView: View {
     @State private var kindFilter: PackageKind? = nil
     @State private var errorMessage: String?
     @State private var ignoredNames: Set<String> = []
+    /// 「仅看屏蔽」:开启后列表只显示被屏蔽升级的包
+    @State private var showIgnoredOnly = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -36,6 +38,19 @@ struct PackagesView: View {
             .frame(maxWidth: 320)
 
             Spacer()
+
+            Button {
+                showIgnoredOnly.toggle()
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: showIgnoredOnly ? "lock.fill" : "lock.open")
+                    Text(showIgnoredOnly ? "仅看屏蔽 (\(ignoredNames.count))" : "仅看屏蔽")
+                }
+                .font(.callout)
+                .foregroundStyle(showIgnoredOnly ? .red : .secondary)
+            }
+            .buttonStyle(.plain)
+            .help(showIgnoredOnly ? "当前只显示被屏蔽升级的包(点击显示全部)" : "只显示被屏蔽升级的包(共 \(ignoredNames.count) 个)")
 
             searchField
             Button {
@@ -87,7 +102,7 @@ struct PackagesView: View {
             ContentUnavailableView(
                 "没有匹配的包",
                 systemImage: "shippingbox",
-                description: Text(searchText.isEmpty ? "未安装任何包" : "没有名称包含「\(searchText)」的包")
+                description: Text(emptyDescription)
             )
         } else {
             List(filtered) { pkg in
@@ -106,8 +121,16 @@ struct PackagesView: View {
     private var filtered: [InstalledPackage] {
         packages
             .filter { kindFilter == nil || $0.kind == kindFilter }
+            .filter { !showIgnoredOnly || ignoredNames.contains($0.name) }
             .filter { searchText.isEmpty || $0.name.localizedCaseInsensitiveContains(searchText) }
             .sorted { $0.kind != $1.kind ? $0.kind == .formula : $0.name < $1.name }
+    }
+
+    private var emptyDescription: String {
+        if showIgnoredOnly {
+            return searchText.isEmpty ? "没有已屏蔽升级的包" : "没有名称包含「\(searchText)」的已屏蔽包"
+        }
+        return searchText.isEmpty ? "未安装任何包" : "没有名称包含「\(searchText)」的包"
     }
 
     // MARK: - 动作
@@ -216,7 +239,7 @@ private struct PackageRow: View {
             Button {
                 onUpgrade()
             } label: {
-                Image(systemName: "arrow.down.circle")
+                Image(systemName: "arrow.triangle.2.circlepath")
             }
             .buttonStyle(.borderless)
             .help("升级 \(package.name)")
@@ -224,10 +247,11 @@ private struct PackageRow: View {
             Button {
                 onIgnore()
             } label: {
-                Image(systemName: isIgnored ? "eye" : "eye.slash")
+                Image(systemName: isIgnored ? "lock.fill" : "lock.open")
+                    .foregroundStyle(isIgnored ? .red : .secondary)
             }
             .buttonStyle(.borderless)
-            .help(isIgnored ? "解除升级屏蔽" : "屏蔽该包的升级")
+            .help(isIgnored ? "已屏蔽升级(点击解除)" : "屏蔽该包的升级")
 
             Button(role: .destructive) {
                 confirmUninstall = true

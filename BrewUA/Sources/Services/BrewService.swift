@@ -166,6 +166,36 @@ final class BrewService {
         return result
     }
 
+    /// 解析 `brew info --json=v2 --cask …` 输出的 auto_updates 字段(token → Bool)。
+    /// 单独抽成静态方法便于单测。返回空字典表示全部无法解析。
+    static func parseCaskAutoUpdates(fromInfoJSON json: String) -> [String: Bool] {
+        struct InfoPayload: Decodable {
+            struct Cask: Decodable {
+                let token: String
+                let auto_updates: Bool?
+            }
+            let casks: [Cask]
+        }
+        guard let data = json.data(using: .utf8),
+              let payload = try? JSONDecoder().decode(InfoPayload.self, from: data) else { return [:] }
+        var result: [String: Bool] = [:]
+        for cask in payload.casks {
+            if let au = cask.auto_updates {
+                result[cask.token] = au
+            }
+        }
+        return result
+    }
+
+    /// 批量查询多个 cask 的 auto_updates(一次 brew info 命令,避免逐包慢查询)。
+    /// 失败返回空字典(UI 降级不显示徽标)。
+    func caskAutoUpdates(names: [String]) async -> [String: Bool] {
+        guard !names.isEmpty else { return [:] }
+        let args = ["info", "--json=v2", "--cask"] + names
+        guard let out = try? await runSerialized(args) else { return [:] }
+        return Self.parseCaskAutoUpdates(fromInfoJSON: out)
+    }
+
     /// 阶段1:下载单个包(流式,带进度事件)。
     /// - `onProgress`: 收到 progress 帧时回调,含已下载/总量/速度
     /// - 下载期间用**定时器独立轮询**缓存文件大小算速度(不依赖 brew 输出事件频率)

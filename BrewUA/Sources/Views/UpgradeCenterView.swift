@@ -175,7 +175,7 @@ struct UpgradeCenterView: View {
             Button {
                 engine.upgrade(packages: selected, options: UpdateOptions(greedy: greedy))
             } label: {
-                Label("更新所选 (\(selected.count))", systemImage: "arrow.down.circle")
+                Label("更新所选 (\(selected.count))", systemImage: "arrow.triangle.2.circlepath")
             }
             .buttonStyle(MainActionButtonStyle())
             .disabled(selected.isEmpty)
@@ -303,6 +303,16 @@ private struct PendingRow: View {
                         .background(entry.kind == .formula ? Color.blue.opacity(0.15) : Color.purple.opacity(0.15))
                         .foregroundStyle(entry.kind == .formula ? Color.blue : Color.purple)
                         .clipShape(Capsule())
+                    if let auto = entry.autoUpdates {
+                        Text(auto ? "自更新" : "手动更新")
+                            .font(.caption2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(auto ? Color.orange.opacity(0.18) : Color.gray.opacity(0.15))
+                            .foregroundStyle(auto ? Color.orange : Color.secondary)
+                            .clipShape(Capsule())
+                            .help(auto ? "该 cask 自带自动更新,手动升级前可先确认是否必要" : "该 cask 不自带自动更新,需手动升级")
+                    }
                 }
                 HStack(spacing: 6) {
                     Text(entry.displayVersion)

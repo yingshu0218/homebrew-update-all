@@ -120,7 +120,11 @@ final class UpdateEngine: ObservableObject {
 
     func cancel() {
         cancelFlag = true
-        // 中断当前包任务(由 run 中每个阶段检查)
+        // 软标志 + 下载级联取消:downloadWithTimeout 内会监听 cancelFlag 主动取消下载 Task
+        // → StreamedProcess.onTermination kill(-pid) 整组终止当前 brew 进程(下载立即停)。
+        // 注意不能直接 runningTask?.cancel():那会连安装中的包(services.install 的 stream)
+        // 一起取消,违背"安装让当前包装完再停"的决策。安装阶段只靠循环头 cancelFlag 判断,
+        // 不启动新包安装,正在安装的包安全装完。
         appendLog("用户请求取消…")
     }
 
@@ -203,7 +207,20 @@ final class UpdateEngine: ObservableObject {
         guard !cancelFlag else { return [] }
 
         let ignoredNames = config.loadIgnored()
-        let entries = filterOutIgnored(outdated, ignored: ignoredNames)
+        var entries = filterOutIgnored(outdated, ignored: ignoredNames)
+        // ③ 补充 cask 的 auto_updates 标识(一次批量查询,升级中心据此显示"自更新"徽标)
+        let caskNames = entries.filter { $0.kind == .cask }.map(\.name)
+        if !caskNames.isEmpty {
+            let autoFlags = await services.caskAutoUpdates(names: caskNames)
+            if !autoFlags.isEmpty {
+                entries = entries.map { entry in
+                    guard entry.kind == .cask, let flag = autoFlags[entry.name] else { return entry }
+                    var e = entry
+                    e.autoUpdates = flag
+                    return e
+                }
+            }
+        }
         pendingUpdates = entries
         return entries
     }
@@ -293,6 +310,8 @@ final class UpdateEngine: ObservableObject {
             appendLog("④ 阶段2:逐个安装(\(toInstall.count) 个)…")
         }
         for (idx, task) in toInstall.enumerated() {
+            // 取消后不再启动新包安装;正在安装的包让其安全装完
+            if cancelFlag { break }
             guard let taskIdx = tasks.firstIndex(where: { $0.id == task.id }) else { continue }
             tasks[taskIdx].status = .installing
             tasks[taskIdx].finishedAt = nil
@@ -303,14 +322,13 @@ final class UpdateEngine: ObservableObject {
                 try await services.install(package: entry) { [weak self] line in
                     self?.appendLog("  " + line)
                 }
-                if cancelFlag {
-                    tasks[taskIdx].status = .canceled
-                } else {
-                    tasks[taskIdx].status = .succeeded
-                    appendLog("✓ \(task.name) 升级完成")
-                }
+                // 安装已完整执行完毕 → 无论是否取消都算成功(用户决策:安装让当前包装完)
+                tasks[taskIdx].status = .succeeded
+                tasks[taskIdx].finishedAt = Date()
+                appendLog("✓ \(task.name) 升级完成")
             } catch {
                 tasks[taskIdx].status = .failed("安装失败")
+                tasks[taskIdx].finishedAt = Date()
                 appendLog("✗ \(task.name) 安装失败:\(error.localizedDescription)")
             }
         }
@@ -341,9 +359,25 @@ final class UpdateEngine: ObservableObject {
                         self.tasks[idx].speedBytesPerSec = speed
                     }
                 })
-                return .success
+                // 正常结束:若期间用户点了取消,也按取消处理(放弃进入阶段2)
+                return cancelFlag ? .canceled : .success
             } catch {
+                // 区分:Task 被取消(用户取消/超时) vs 真实失败
+                if Task.isCancelled || cancelFlag {
+                    return .canceled
+                }
                 return .failed(error.localizedDescription)
+            }
+        }
+
+        // 取消监听:用户点击「取消」→ cancelFlag 置位 → 立即取消下载 Task
+        // → StreamedProcess.onTermination kill(-pid) 整组终止 brew(下载立即停,不等当前包下完)
+        let cancelWatcher = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 150_000_000) // 150ms 轮询一次
+                guard let self, self.cancelFlag, !task.isCancelled else { continue }
+                task.cancel()
+                return
             }
         }
 
@@ -356,7 +390,7 @@ final class UpdateEngine: ObservableObject {
         }
         let result = await task.value
         timeoutTask.cancel()
-        if cancelFlag { return .canceled }
+        cancelWatcher.cancel()
         return result
     }
 
