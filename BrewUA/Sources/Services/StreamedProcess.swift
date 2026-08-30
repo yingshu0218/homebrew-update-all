@@ -203,7 +203,7 @@ final class StreamedProcess {
 
     /// 定位 brew 可执行文件:/opt/homebrew/bin/brew 或 /usr/local/bin/brew
     static func brewExecutablePath() -> String {
-        let candidates = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+        let candidates = Constants.brewPathCandidates
         for c in candidates where FileManager.default.isExecutableFile(atPath: c) {
             return c
         }

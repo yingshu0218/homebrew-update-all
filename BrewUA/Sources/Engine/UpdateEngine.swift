@@ -9,7 +9,6 @@ enum EnginePhase: Equatable {
     case phase1Download
     case phase2Install
     case cleanup
-    case summary
     case failed(String)
     case canceled
     case finished
@@ -43,7 +42,7 @@ final class UpdateEngine: ObservableObject {
     private let services: BrewServicing
     private let config = ConfigService.shared
     /// 单包下载超时(秒),与 brew-ua 默认 600 一致
-    var fetchTimeout: TimeInterval = 600
+    var fetchTimeout: TimeInterval = Constants.fetchTimeout
 
     init(services: BrewServicing = BrewService.shared) {
         self.services = services
@@ -67,7 +66,6 @@ final class UpdateEngine: ObservableObject {
         case .phase1Download: return "下载阶段"
         case .phase2Install: return "安装阶段"
         case .cleanup: return "清理"
-        case .summary: return "完成"
         case .failed(let reason): return "失败: \(reason)"
         case .canceled: return "已取消"
         case .finished: return "完成"
@@ -76,13 +74,20 @@ final class UpdateEngine: ObservableObject {
 
     // MARK: - 公开控制
 
-    /// 开始一次"仅检测"：只做 brew update + 列出待更新清单，不下载不安装。
-    /// 结果存到 pendingUpdates,供升级中心展示勾选式清单。幂等:已在运行时忽略。
-    func checkOnly(options: UpdateOptions = UpdateOptions()) {
-        guard !isRunning else { return }
+    /// 运行前公共复位。返回 false 表示已有任务在跑(调用方直接 return)。
+    @discardableResult
+    private func beginRun() -> Bool {
+        guard !isRunning else { return false }
         cancelFlag = false
         isRunning = true
         summary = nil
+        return true
+    }
+
+    /// 开始一次"仅检测"：只做 brew update + 列出待更新清单，不下载不安装。
+    /// 结果存到 pendingUpdates,供升级中心展示勾选式清单。幂等:已在运行时忽略。
+    func checkOnly(options: UpdateOptions = UpdateOptions()) {
+        guard beginRun() else { return }
         tasks = []
         pendingUpdates = []
         runningTask = Task { [weak self] in
@@ -92,11 +97,7 @@ final class UpdateEngine: ObservableObject {
 
     /// 升级指定的包(两阶段:下载→安装)。
     func upgrade(packages: [OutdatedEntry], options: UpdateOptions = UpdateOptions()) {
-        guard !isRunning else { return }
-        guard !packages.isEmpty else { return }
-        cancelFlag = false
-        isRunning = true
-        summary = nil
+        guard !packages.isEmpty, beginRun() else { return }
         tasks = packages.map { PackageTask(name: $0.name, kind: $0.kind, status: .queued) }
         let startTime = Date()
         runningTask = Task { [weak self] in
@@ -106,10 +107,7 @@ final class UpdateEngine: ObservableObject {
 
     /// 兼容包装:升级全部待更新(老入口,不查看是否已检测)。
     func start(options: UpdateOptions = UpdateOptions()) {
-        guard !isRunning else { return }
-        cancelFlag = false
-        isRunning = true
-        summary = nil
+        guard beginRun() else { return }
         tasks = []
         runningTask = Task { [weak self] in
             guard let self else { return }
@@ -160,15 +158,11 @@ final class UpdateEngine: ObservableObject {
 
     /// 重试上一轮失败/超时的包(不走 brew update,直接下载→安装)。
     func retryFailed() {
-        guard !isRunning else { return }
         let failed = tasks.filter {
             if case .failed = $0.status { return true }
             return $0.status == .timeout || $0.status == .canceled
         }
-        guard !failed.isEmpty else { return }
-        cancelFlag = false
-        isRunning = true
-        summary = nil
+        guard !failed.isEmpty, beginRun() else { return }
         // 重置这些任务为 queued,其余移除
         let failedNames = Set(failed.map(\.name))
         tasks = tasks.filter { failedNames.contains($0.name) }.map {
@@ -249,7 +243,7 @@ final class UpdateEngine: ObservableObject {
         }
         if entries.isEmpty {
             appendLog("没有需要更新的包 ✓")
-            finish(.finished, summary: RunSummary(total: 0, succeeded: 0, failed: 0, timeout: 0, skipped: 0, totalDuration: Date().timeIntervalSince(startTime), failedNames: []))
+            finish(.finished, summary: RunSummary(total: 0, succeeded: 0, failed: 0, timeout: 0, totalDuration: Date().timeIntervalSince(startTime), failedNames: []))
         } else {
             appendLog("待更新 \(entries.count) 个包(formula \(entries.filter { $0.kind == .formula }.count), cask \(entries.filter { $0.kind == .cask }.count)),点击「更新所选」或「全部更新」开始升级")
             finish(.finished, summary: nil)
@@ -269,8 +263,7 @@ final class UpdateEngine: ObservableObject {
         }
         if entries.isEmpty {
             appendLog("没有需要更新的包 ✓")
-            phase = .summary
-            finish(.finished, summary: RunSummary(total: 0, succeeded: 0, failed: 0, timeout: 0, skipped: 0, totalDuration: Date().timeIntervalSince(startTime), failedNames: []))
+            finish(.finished, summary: RunSummary(total: 0, succeeded: 0, failed: 0, timeout: 0, totalDuration: Date().timeIntervalSince(startTime), failedNames: []))
             return
         }
         appendLog("待更新 \(entries.count) 个包(formula \(entries.filter { $0.kind == .formula }.count), cask \(entries.filter { $0.kind == .cask }.count))")
@@ -372,8 +365,8 @@ final class UpdateEngine: ObservableObject {
     ///   kill(-pid) 整组终止 brew 进程(旧实现三个游离 Task 手动管理,且超时
     ///   引发的取消会被误标为 canceled/failed,.timeout 实际是死路径)
     /// - 下载任务 @MainActor:onProgress/onLine 都在主线程回调,改 tasks@Published 安全
-    private func downloadWithTimeout(package: OutdatedEntry, onLine: @escaping (String) -> Void) async -> DowloadOutcome {
-        await withTaskGroup(of: DowloadOutcome.self) { group in
+    private func downloadWithTimeout(package: OutdatedEntry, onLine: @escaping (String) -> Void) async -> DownloadOutcome {
+        await withTaskGroup(of: DownloadOutcome.self) { group in
             // ① 下载主体
             group.addTask { @MainActor in
                 do {
@@ -433,7 +426,6 @@ final class UpdateEngine: ObservableObject {
             succeeded: success,
             failed: failed,
             timeout: timedOut,
-            skipped: 0,
             totalDuration: Date().timeIntervalSince(startTime),
             failedNames: tasks.compactMap { task in
                 if case .failed = task.status { return task.name }
@@ -463,7 +455,7 @@ final class UpdateEngine: ObservableObject {
 }
 
 /// 每个包下载的结果
-enum DowloadOutcome {
+enum DownloadOutcome {
     case success
     case timeout
     case failed(String)

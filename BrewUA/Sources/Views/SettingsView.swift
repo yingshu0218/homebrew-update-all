@@ -49,7 +49,7 @@ struct SettingsView: View {
                 HStack(spacing: 16) {
                     Label(info.mirrorSource.displayName, systemImage: "checkmark.seal")
                         .font(.body.weight(.medium))
-                        .foregroundStyle(mirrorColor(info.mirrorSource))
+                        .foregroundStyle(info.mirrorSource.tint)
                     Text(info.isNetworkOk ? "网络可达(\(info.networkCountry))" : "网络不可达")
                         .font(.caption)
                         .foregroundStyle(info.isNetworkOk ? Color.green : Color.red)
@@ -61,8 +61,7 @@ struct SettingsView: View {
                     }
                 }
                 .padding(12)
-                .background(.quaternary.opacity(0.35))
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .cardBackground(cornerRadius: 12)
 
                 DisclosureGroup("查看 tap 远程地址") {
                     ForEach(Array(info.tapRemotes.keys.sorted()), id: \.self) { tap in
@@ -87,13 +86,6 @@ struct SettingsView: View {
         }
     }
 
-    private func mirrorColor(_ source: MirrorSource) -> Color {
-        switch source {
-        case .ustc, .tsinghua, .aliyun: return .orange
-        case .official: return .teal
-        case .unknown: return .gray
-        }
-    }
 
     // MARK: - 屏蔽列表
 
@@ -140,8 +132,7 @@ struct SettingsView: View {
                         }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
-                        .background(.quaternary.opacity(0.35))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .cardBackground(cornerRadius: 8)
                     }
                 }
             }

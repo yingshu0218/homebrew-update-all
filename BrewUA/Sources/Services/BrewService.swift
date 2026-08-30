@@ -165,13 +165,13 @@ final class BrewService: BrewServicing {
     /// HEAD 请求下载地址,拿 `Content-Length`(字节)作为包总大小。失败返回 nil(调用侧降级)。
     /// async 实现:等待网络响应期间让出线程(修复旧 DispatchSemaphore 同步等待
     /// 在 @MainActor 上最长卡主线程 16s 的问题)。
-    nonisolated static func probeDownloadSize(urlString: String, timeout: TimeInterval = 15) async -> Int64? {
+    nonisolated static func probeDownloadSize(urlString: String, timeout: TimeInterval = Constants.headProbeTimeout) async -> Int64? {
         guard let url = URL(string: urlString) else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
         request.timeoutInterval = timeout
         // 兼容部分 CDN 需要 UA,否则 403/404
-        request.setValue("curl/8.7.1", forHTTPHeaderField: "User-Agent")
+        request.setValue(Constants.headProbeUserAgent, forHTTPHeaderField: "User-Agent")
         guard let (_, resp) = try? await URLSession.shared.data(for: request),
               let http = resp as? HTTPURLResponse,
               (200..<300).contains(http.statusCode),
@@ -235,7 +235,7 @@ final class BrewService: BrewServicing {
         try await withBrewGate {
             let proc = StreamedProcess(brewArguments: ["fetch", flag, package.name])
             // 独立定时器轮询缓存文件大小算速度(不依赖 brew 输出事件频率)
-            let poll = PollingMonitor(packageName: package.name, kind: package.kind, interval: 0.6) { bytes, speed in
+            let poll = PollingMonitor(packageName: package.name, kind: package.kind, interval: Constants.downloadPollInterval) { bytes, speed in
                 onProgress(bytes, total, speed)
             }
             poll.start()
@@ -420,12 +420,6 @@ final class BrewService: BrewServicing {
 
     // MARK: - cache location
 
-    /// 定位单个包的下载缓存文件大小(字节)。
-    /// - 优先 `.incomplete`(下载中);下载完成后文件被改名为正式文件名,兜底匹配。
-    /// - 失败返回 nil(上层降级为只解析日志)
-    nonisolated static func downloadFileBytes(packageName: String, kind: PackageKind) -> Int64? {
-        currentDownloadFileSize(packageName: packageName)
-    }
 
     /// 在 brew 下载目录里找与该包相关的"活跃下载文件"大小。
     /// - 包名匹配:名称前缀包含包名(兼容 `xxx--<name>--...` 的 hash 文件名,也兼容明文 URL 文件名)

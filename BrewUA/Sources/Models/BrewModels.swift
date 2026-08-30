@@ -145,7 +145,6 @@ struct RunSummary {
     var succeeded: Int = 0
     var failed: Int = 0
     var timeout: Int = 0
-    var skipped: Int = 0
     var totalDuration: TimeInterval = 0
     var failedNames: [String] = []
 

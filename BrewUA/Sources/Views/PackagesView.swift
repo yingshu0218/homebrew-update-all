@@ -170,12 +170,13 @@ struct PackagesView: View {
     }
 
     /// 在升级屏蔽列表中添加/移除该包
+    /// 磁盘写入失败时不更新内存状态(避免 UI 与 ~/.config/brew-ua/ignored_casks 不一致)
     private func toggleIgnore(_ pkg: InstalledPackage) {
         if ignoredNames.contains(pkg.name) {
-            try? config.removeIgnored(pkg.name)
+            guard (try? config.removeIgnored(pkg.name)) != nil else { return }
             ignoredNames.remove(pkg.name)
         } else {
-            try? config.addIgnored(pkg.name)
+            guard (try? config.addIgnored(pkg.name)) != nil else { return }
             ignoredNames.insert(pkg.name)
         }
     }

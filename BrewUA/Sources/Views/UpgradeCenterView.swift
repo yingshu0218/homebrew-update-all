@@ -35,7 +35,7 @@ struct UpgradeCenterView: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onChange(of: engine.pendingUpdates.count) { _ in
+        .onChange(of: engine.pendingUpdates.count) { _, _ in
             // 清单刷新时重置勾选(避免残留旧勾选)
             selectedNames = Set(engine.pendingUpdates.map(\.name))
         }
@@ -253,7 +253,7 @@ struct UpgradeCenterView: View {
                 .frame(maxHeight: 140)
                 .background(.quaternary.opacity(0.2))
                 .clipShape(RoundedRectangle(cornerRadius: 8))
-                .onChange(of: engine.eventLog.count) { _ in
+                .onChange(of: engine.eventLog.count) { _, _ in
                     withAnimation(.easeOut(duration: 0.2)) {
                         proxy.scrollTo("log-bottom", anchor: .bottom)
                     }
@@ -296,13 +296,7 @@ private struct PendingRow: View {
                         .font(.body.weight(.medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text(entry.kind == .formula ? "formula" : "cask")
-                        .font(.caption2)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(entry.kind == .formula ? Color.blue.opacity(0.15) : Color.purple.opacity(0.15))
-                        .foregroundStyle(entry.kind == .formula ? Color.blue : Color.purple)
-                        .clipShape(Capsule())
+                    KindBadge(kind: entry.kind)
                     if let auto = entry.autoUpdates {
                         Text(auto ? "自更新" : "手动更新")
                             .font(.caption2)
@@ -344,12 +338,7 @@ struct TaskRow: View {
                         .fontWeight(.medium)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text(task.kind == .formula ? "formula" : "cask")
-                        .font(.caption2)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(.quaternary)
-                        .clipShape(Capsule())
+                    KindBadge(kind: task.kind)
                 }
                 progressOrStatus
             }
@@ -387,8 +376,7 @@ struct TaskRow: View {
             }
         }
         .padding(10)
-        .background(.quaternary.opacity(0.35))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .cardBackground(cornerRadius: 8)
     }
 
     /// 状态徽章:按阶段着色、淡入,比小圆点更直观(下载中/已下载待安装/安装中/完成/失败)

@@ -28,7 +28,7 @@ struct OverviewView: View {
             quickActions
         }
         .padding(20)
-        .task { refresh() }
+.task { await refreshAsync() }
     }
 
     private var header: some View {
@@ -64,7 +64,7 @@ struct OverviewView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
-            metricCard("镜像源", info.mirrorSource.displayName, icon: "network", tint: mirrorTint(info.mirrorSource)) {
+            metricCard("镜像源", info.mirrorSource.displayName, icon: "network", tint: info.mirrorSource.tint) {
                 Text(info.isNetworkOk ? "网络可达 · \(info.networkCountry)" : "网络不可达")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -101,18 +101,9 @@ struct OverviewView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .frame(minHeight: 92, alignment: .topLeading)
         .padding(14)
-        .background(.quaternary.opacity(0.35))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .cardBackground(cornerRadius: 12)
         .contentShape(RoundedRectangle(cornerRadius: 12))
         .onTapGesture { onTap?() }
-    }
-
-    private func mirrorTint(_ source: MirrorSource) -> Color {
-        switch source {
-        case .ustc, .tsinghua, .aliyun: return .orange
-        case .official: return .teal
-        case .unknown: return .gray
-        }
     }
 
     private var quickActions: some View {
@@ -143,32 +134,32 @@ struct OverviewView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(14)
-            .background(.quaternary.opacity(0.35))
-            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .cardBackground(cornerRadius: 12)
         }
         .buttonStyle(.plain)
     }
 
     private func refresh() {
+        Task { await refreshAsync() }
+    }
+
+    /// 结构化并发刷新:.task 调用时随视图生命周期自动取消,不再出现
+    /// "视图已销毁任务还在跑并写状态" 的非结构化 Task 泄漏
+    private func refreshAsync() async {
         guard !isLoading else { return }
         isLoading = true
+        defer { isLoading = false }
         let brew = BrewService.shared
-        Task {
-            async let info = EnvDetector.detect()
-            async let stats = brew.overviewStats()
-            let (env, stat) = await (info, stats)
-            await MainActor.run {
-                self.envInfo = env
-                self.appModel.brewPrefix = env.prefix
-                self.appModel.brewVersion = env.brewVersion
-                self.appModel.installedFormulaCount = stat.installedFormulae
-                self.appModel.installedCaskCount = stat.installedCasks
-                self.appModel.outdatedCount = stat.outdatedFormulae + stat.outdatedCasks
-                self.appModel.outdatedFormulaCount = stat.outdatedFormulae
-                self.appModel.outdatedCaskCount = stat.outdatedCasks
-                self.appModel.outdatedReliable = stat.outdatedReliable
-                self.isLoading = false
-            }
-        }
+        async let info = EnvDetector.detect()
+        async let stats = brew.overviewStats()
+        let (env, stat) = await (info, stats)
+        guard !Task.isCancelled else { return }
+        envInfo = env
+        appModel.installedFormulaCount = stat.installedFormulae
+        appModel.installedCaskCount = stat.installedCasks
+        appModel.outdatedCount = stat.outdatedFormulae + stat.outdatedCasks
+        appModel.outdatedFormulaCount = stat.outdatedFormulae
+        appModel.outdatedCaskCount = stat.outdatedCasks
+        appModel.outdatedReliable = stat.outdatedReliable
     }
 }
