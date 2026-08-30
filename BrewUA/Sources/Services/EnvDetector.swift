@@ -35,10 +35,11 @@ enum EnvDetector {
         var country = ""
         var netOK = false
 
-        let brewPathResult = try? await StreamedProcess(brewArguments: ["--prefix"]).runSync()
+        // 所有 brew 命令统一走 BrewService 闸门入口(串行,避免与升级流程并发冲突)
+        let brewPathResult = await BrewService.shared.brewOutput(["--prefix"])
         prefix = brewPathResult?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
-        if let v = try? await StreamedProcess(brewArguments: ["--version"]).runSync() {
+        if let v = await BrewService.shared.brewOutput(["--version"]) {
             // 第一行形如:Homebrew 4.6.2-... 或 Homebrew 4.6.2
             version = v.split(separator: "\n").first.map(String.init) ?? ""
         }
@@ -59,7 +60,7 @@ enum EnvDetector {
             .values
             .joined(separator: " ")
         let shellText = readShellBrewEnv()
-        let brewConfigText = (try? await StreamedProcess(brewArguments: ["config"]).runSync()) ?? ""
+        let brewConfigText = await BrewService.shared.brewOutput(["config"]) ?? ""
         let mergedMirrorText = envText + " " + shellText + " " + brewConfigText + " " + tapRemotes.values.joined(separator: " ")
 
         return EnvironmentInfo(

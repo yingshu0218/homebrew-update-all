@@ -16,21 +16,14 @@ struct BrewUAApp: App {
                     if engine.isRunning {
                         engine.cancel()
                     }
-                    // 断开所有子进程(如果仍在跑 brew)
-                    terminateRunningBrew()
+                    // 只终止本 App 自己启动的 brew 进程(登记表),不用 pkill 全局匹配——
+                    // 旧实现 pkill -f 会误杀用户终端里自跑的 brew 命令
+                    StreamedProcess.terminateAllActive()
                 }
         }
         .windowResizability(.contentMinSize)
         // 注意:不要在这里加 .commands 的 CommandGroup —— 之前把 engine.isRunning 等状态
         // 绑定进主菜单导致 SwiftUI 更新 AppKit 主菜单时触发 NSMenu 断言崩溃(SIGABRT)。
         // 保留系统默认菜单(App 菜单/About/退出)最稳定。
-    }
-
-    private func terminateRunningBrew() {
-        // 尽力而为:若仍有 brew 进程,发 SIGTERM(StreamedProcess 超时熔断已覆盖常规场景)
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
-        proc.arguments = ["-TERM", "-f", "brew (fetch|install|upgrade|reinstall)"]
-        try? proc.run()
     }
 }

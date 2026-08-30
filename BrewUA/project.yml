@@ -34,11 +34,15 @@ targets:
       testTargets:
         - BrewUATests
   BrewUATests:
+    # 测试 target 直接编入被测源文件(非 TEST_HOST 模式):
+    # 实测 TEST_HOST 依赖 app 时 runner 挂起无法建立连接;复制源文件模式下
+    # internal 符号直接可见,无需 @testable import。新增被测文件须同步登记。
     type: bundle.unit-test
     platform: macOS
     sources:
       - Tests
       - path: Sources/Services/StreamedProcess.swift
+      - path: Sources/Services/BrewGate.swift
       - path: Sources/Services/BrewService.swift
       - path: Sources/Services/ConfigService.swift
       - path: Sources/Services/EnvDetector.swift

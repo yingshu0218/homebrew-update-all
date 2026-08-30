@@ -87,8 +87,9 @@ struct ServicesView: View {
         case .restart: args = ["services", "restart", svc.name]
         }
         do {
-            let proc = StreamedProcess(brewArguments: args)
-            _ = try await proc.runSync()
+            _ = try await withBrewGate {
+                try await StreamedProcess(brewArguments: args).runSync()
+            }
             lastAction = "已\(action.title) \(svc.name)"
         } catch {
             lastAction = "操作失败:\(error.localizedDescription)"

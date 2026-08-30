@@ -186,8 +186,7 @@ struct PackagesView: View {
         let name = pkg.name
         Task {
             let flag = pkg.kind == .formula ? "--formula" : "--cask"
-            let proc = StreamedProcess(brewArguments: ["uninstall", flag, name])
-            let result = await proc.runSyncChecked()
+            let result = await brew.brewChecked(["uninstall", flag, name])
             uninstallingName = nil
             if result.success {
                 await load()

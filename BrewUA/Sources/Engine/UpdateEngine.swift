@@ -40,12 +40,12 @@ final class UpdateEngine: ObservableObject {
 
     private var cancelFlag = false
     private var runningTask: Task<Void, Never>?
-    private let services: BrewService
+    private let services: BrewServicing
     private let config = ConfigService.shared
     /// 单包下载超时(秒),与 brew-ua 默认 600 一致
     var fetchTimeout: TimeInterval = 600
 
-    init(services: BrewService = .shared) {
+    init(services: BrewServicing = BrewService.shared) {
         self.services = services
     }
 
@@ -195,7 +195,7 @@ final class UpdateEngine: ObservableObject {
     /// ① brew update + ② 列出待更新(过滤屏蔽),返回非空时也填充 pendingUpdates。
     /// 被 run()(直接升级)与 runCheckOnly()(仅检测)共用。
     /// - Returns: nil = 本轮已终结(update 失败/取消,调用方直接 return,不再 finish)
-    private func fetchOutdated(options: UpdateOptions) async -> [OutdatedEntry]? {
+    func fetchOutdated(options: UpdateOptions) async -> [OutdatedEntry]? {
         // ① brew update:失败不能静默——用旧索引继续升级可能装到旧版本
         phase = .updatingTaps
         appendLog("① 更新 Homebrew 源…")
@@ -283,7 +283,12 @@ final class UpdateEngine: ObservableObject {
 
     /// ③ 阶段1:逐包下载(带超时熔断)→ ④ 阶段2:安装下载成功的 → ⑤ cleanup。
     /// 供 start 与 retryFailed 复用;entries 为待处理包。
-    private func runPhase1And2(entries: [OutdatedEntry], startTime: Date) async {
+    /// internal 便于测试注入 mock 直接驱动状态机。
+    /// 任务列表在本方法初始化(retryFailed 预置重试清单时 tasks 非空,不覆盖)。
+    func runPhase1And2(entries: [OutdatedEntry], startTime: Date) async {
+        if tasks.isEmpty {
+            tasks = entries.map { PackageTask(name: $0.name, kind: $0.kind, status: .queued) }
+        }
         // ③ 阶段1:逐包下载
         phase = .phase1Download
         appendLog("③ 阶段1:逐个下载…")
@@ -361,55 +366,52 @@ final class UpdateEngine: ObservableObject {
         finish(.finished, summary: buildSummary(startTime: startTime))
     }
 
+    /// 单包下载:三路竞速(下载 / 超时熔断 / 取消监听),先到先得。
+    /// - 下载完成 → .success/.failed;超时 → .timeout;用户取消 → .canceled
+    /// - 竞速结束后 group.cancelAll():取消下载任务 → StreamedProcess.onTermination
+    ///   kill(-pid) 整组终止 brew 进程(旧实现三个游离 Task 手动管理,且超时
+    ///   引发的取消会被误标为 canceled/failed,.timeout 实际是死路径)
+    /// - 下载任务 @MainActor:onProgress/onLine 都在主线程回调,改 tasks@Published 安全
     private func downloadWithTimeout(package: OutdatedEntry, onLine: @escaping (String) -> Void) async -> DowloadOutcome {
-        // 用 Task + duration 超时实现(不忙等);超时后整组 kill
-        // 显式 @MainActor:fetch 的 for-await 恢复沿用本 actor 上下文,onProgress/onLine
-        // 都在主线程回调,直接改 tasks@Published 不会触发后台线程 UI 重建。
-        let task = Task { @MainActor () -> DowloadOutcome in
-            do {
-                try await services.fetch(package: package, onLine: { line in
-                    onLine(line)
-                }, onProgress: { [weak self] bytes, total, speed in
-                    guard let self, !Task.isCancelled else { return }
-                    if let idx = self.tasks.firstIndex(where: { $0.name == package.name }) {
-                        self.tasks[idx].bytesDownloaded = bytes
-                        self.tasks[idx].totalBytes = total
-                        self.tasks[idx].speedBytesPerSec = speed
-                    }
-                })
-                // 正常结束:若期间用户点了取消,也按取消处理(放弃进入阶段2)
-                return cancelFlag ? .canceled : .success
-            } catch {
-                // 区分:Task 被取消(用户取消/超时) vs 真实失败
-                if Task.isCancelled || cancelFlag {
+        await withTaskGroup(of: DowloadOutcome.self) { group in
+            // ① 下载主体
+            group.addTask { @MainActor in
+                do {
+                    try await self.services.fetch(package: package, onLine: { line in
+                        onLine(line)
+                    }, onProgress: { bytes, total, speed in
+                        guard !Task.isCancelled else { return }
+                        if let idx = self.tasks.firstIndex(where: { $0.name == package.name }) {
+                            self.tasks[idx].bytesDownloaded = bytes
+                            self.tasks[idx].totalBytes = total
+                            self.tasks[idx].speedBytesPerSec = speed
+                        }
+                    })
+                    // 正常结束:若期间用户点了取消,也按取消处理(放弃进入阶段2)
+                    return self.cancelFlag ? .canceled : .success
+                } catch is CancellationError {
                     return .canceled
+                } catch {
+                    return .failed(error.localizedDescription)
                 }
-                return .failed(error.localizedDescription)
             }
-        }
-
-        // 取消监听:用户点击「取消」→ cancelFlag 置位 → 立即取消下载 Task
-        // → StreamedProcess.onTermination kill(-pid) 整组终止 brew(下载立即停,不等当前包下完)
-        let cancelWatcher = Task { @MainActor [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 150_000_000) // 150ms 轮询一次
-                guard let self, self.cancelFlag, !task.isCancelled else { continue }
-                task.cancel()
-                return
+            // ② 超时熔断(与 brew-ua 单包超时同语义)
+            group.addTask { [fetchTimeout] in
+                try? await Task.sleep(nanoseconds: UInt64(fetchTimeout * 1_000_000_000))
+                return .timeout
             }
-        }
-
-        // 超时熔断(与 brew-ua 单包超时同语义)
-        let timeoutTask = Task {
-            try? await Task.sleep(nanoseconds: UInt64(fetchTimeout * 1_000_000_000))
-            if !task.isCancelled {
-                task.cancel()
+            // ③ 取消监听:用户点击「取消」→ cancelFlag 置位 → 立即返回取消
+            group.addTask { @MainActor [weak self] in
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                    if self?.cancelFlag == true { return .canceled }
+                }
+                return .canceled
             }
+            let first = await group.next() ?? .canceled
+            group.cancelAll() // 取消其余竞速者(含下载任务 → 杀 brew 进程)
+            return first
         }
-        let result = await task.value
-        timeoutTask.cancel()
-        cancelWatcher.cancel()
-        return result
     }
 
     private func finish(_ phase: EnginePhase, summary: RunSummary?) {
@@ -444,12 +446,9 @@ final class UpdateEngine: ObservableObject {
 
     func cleanup(onLog: @escaping (String) -> Void = { _ in }) async {
         appendLog("⑤ 清理缓存…")
-        // 简单一次性 cleanup,不逐显示
-        let proc = StreamedProcess(brewArguments: ["cleanup", "--prune=all"])
-        do {
-            _ = try await proc.runSync()
-        } catch {
-            appendLog("cleanup 失败:\(error.localizedDescription)")
+        let ok = await services.cleanupAll()
+        if !ok {
+            appendLog("cleanup 失败")
         }
         onLog("cleanup 完成")
         appendLog("cleanup 完成")

@@ -131,6 +131,38 @@ final class StreamedProcess {
     /// 退出码(terminationHandler 触发后可读;nil = 尚未退出)
     private(set) var terminationStatus: Int32?
 
+    // MARK: - 活跃进程登记(供 App 退出时精准终止,替代误伤面过大的 pkill -f)
+
+    private static let registryLock = NSLock()
+    private static var activePIDs: Set<Int32> = []
+
+    static func registerActive(pid: Int32) {
+        guard pid > 0 else { return }
+        registryLock.lock()
+        activePIDs.insert(pid)
+        registryLock.unlock()
+    }
+
+    static func unregisterActive(pid: Int32) {
+        registryLock.lock()
+        activePIDs.remove(pid)
+        registryLock.unlock()
+    }
+
+    /// 终止本 App 启动的全部活跃 brew 进程(SIGTERM)。
+    /// 只碰登记表里的 PID,不匹配系统命令行——不会误杀用户终端里自跑的 brew。
+    static func terminateAllActive() {
+        registryLock.lock()
+        let pids = activePIDs
+        registryLock.unlock()
+        for pid in pids {
+            let groupKilled = kill(-pid, SIGTERM) == 0
+            if !groupKilled {
+                kill(pid, SIGTERM)
+            }
+        }
+    }
+
     static let brewEnv: [String: String] = {
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -229,6 +261,7 @@ final class StreamedProcess {
 
             do {
                 try p.run()
+                StreamedProcess.registerActive(pid: p.processIdentifier)
             } catch {
                 continuation.finish(throwing: ProcessError.spawnFailed("\(executableURL.path) \(arguments.joined(separator: " "))"))
                 return
@@ -236,6 +269,7 @@ final class StreamedProcess {
 
             continuation.onTermination = { @Sendable _ in
                 let pid = p.processIdentifier
+                StreamedProcess.unregisterActive(pid: pid)
                 if pid > 0 {
                     // setsid 成功时子进程是新会话组长,-pid 可整组终止;
                     // setsid 被拒时子进程在原进程组,组终止会 EPERM,降级杀主进程。

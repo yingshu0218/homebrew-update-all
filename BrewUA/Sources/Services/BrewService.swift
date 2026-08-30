@@ -1,31 +1,48 @@
 import Foundation
 
+/// brew 数据层协议:供 UpdateEngine 注入测试替身(mock)。
+/// 生产实现为 BrewService;测试用 MockBrewService 验证升级状态机全路径。
+@MainActor
+protocol BrewServicing: AnyObject {
+    func update(onLine: @escaping (String) -> Void) async throws
+    func outdatedAll(greedy: Bool) async -> [OutdatedEntry]
+    func fetch(package: OutdatedEntry, onLine: @escaping (String) -> Void, onProgress: @escaping (Int64, Int64, Double) -> Void) async throws
+    func install(package: OutdatedEntry, onLine: @escaping (String) -> Void) async throws
+    func caskAutoUpdates(names: [String]) async -> [String: Bool]
+    /// 清理缓存(brew cleanup --prune=all);返回是否成功
+    func cleanupAll() async -> Bool
+}
+
 /// brew 数据层:封装 brew 的 JSON 接口。
 /// 参考成熟方案(brew-browser/Cork)的数据策略:全部走 `brew ... --json` 结构化数据,
 /// 只有执行型命令才走流式输出。
-final class BrewService {
+final class BrewService: BrewServicing {
     static let shared = BrewService()
     private let config = ConfigService.shared
-    /// 互斥锁:同一时刻只允许一个 brew 子进程运行。
-    /// Homebrew 有全局锁,并发调用会互相等待甚至报 "Another active Homebrew process"，所以 GUI 内部必须串行化。
-    private let brewLock = NSLock()
-    /// 等待中的调用者数(用于每次调用排队而不是直接丢弃)
-    private var waitingCount = 0
 
     init() {}
 
     /// 串行执行一个 brew 同步命令,返回 stdout 字符串。
-    /// 用轮询式自旋等待锁,避免 async/await 与 DispatchQueue 组合的复杂性。
+    /// 走全局 BrewGate 异步排队(替代旧 NSLock 自旋:跨 await 解锁属未定义行为且忙等)。
     private func runSerialized(_ arguments: [String]) async throws -> String {
-        // 尝试获取锁;拿不到则短暂让步后重试(最多等 10 秒)
-        for _ in 0..<200 {
-            if brewLock.try() {
-                defer { brewLock.unlock() }
-                return try await StreamedProcess(brewArguments: arguments).runSync()
-            }
-            try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
+        try await withBrewGate {
+            try await StreamedProcess(brewArguments: arguments).runSync()
         }
-        throw BrewError.busy
+    }
+
+    /// 同步执行 brew 命令,返回输出;失败(含排队外的真实失败)返回 nil。
+    /// 供 EnvDetector 等绕开 BrewService 内部方法的调用方统一走闸门。
+    func brewOutput(_ arguments: [String], timeout: TimeInterval = 30) async -> String? {
+        try? await withBrewGate {
+            try await StreamedProcess(brewArguments: arguments).runSync(timeout: timeout)
+        }
+    }
+
+    /// 同步执行 brew 命令,返回 (输出, 是否成功退出)。失败给出明确状态而非静默。
+    func brewChecked(_ arguments: [String], timeout: TimeInterval = 120) async -> (output: String, success: Bool) {
+        (try? await withBrewGate {
+            await StreamedProcess(brewArguments: arguments).runSyncChecked(timeout: timeout)
+        }) ?? ("", false)
     }
 
     // MARK: - brew update
@@ -36,9 +53,11 @@ final class BrewService {
     /// 回调改 @Published 会触发 SwiftUI 后台重建主菜单崩溃(SIGABRT)。
     @MainActor
     func update(onLine: @escaping (String) -> Void) async throws {
-        let proc = StreamedProcess(brewArguments: ["update"])
-        for try await event in proc.run() {
-            onLine(event.text)
+        try await withBrewGate {
+            let proc = StreamedProcess(brewArguments: ["update"])
+            for try await event in proc.run() {
+                onLine(event.text)
+            }
         }
     }
 
@@ -76,7 +95,7 @@ final class BrewService {
     }
 
     /// 解析 outdated --json 输出(`{"formulae":[...],"casks":[...]}` snake_case 字段)
-    static func parseOutdatedJSON(_ json: String, kind: PackageKind) -> [OutdatedEntry] {
+    nonisolated static func parseOutdatedJSON(_ json: String, kind: PackageKind) -> [OutdatedEntry] {
         struct OutdatedPayload: Decodable {
             struct Item: Decodable {
                 let name: String
@@ -112,7 +131,7 @@ final class BrewService {
 
     /// 从 `brew info --json=v2` 输出里提取首个下载 URL(回退解析)。
     /// 单独抽成静态方法便于单测。
-    static func extractDownloadURL(fromInfoJSON json: String) -> String? {
+    nonisolated static func extractDownloadURL(fromInfoJSON json: String) -> String? {
         struct InfoPayload: Decodable {
             struct Formula: Decodable {
                 let urls: [String]?
@@ -146,7 +165,7 @@ final class BrewService {
     /// HEAD 请求下载地址,拿 `Content-Length`(字节)作为包总大小。失败返回 nil(调用侧降级)。
     /// async 实现:等待网络响应期间让出线程(修复旧 DispatchSemaphore 同步等待
     /// 在 @MainActor 上最长卡主线程 16s 的问题)。
-    static func probeDownloadSize(urlString: String, timeout: TimeInterval = 15) async -> Int64? {
+    nonisolated static func probeDownloadSize(urlString: String, timeout: TimeInterval = 15) async -> Int64? {
         guard let url = URL(string: urlString) else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
@@ -163,7 +182,7 @@ final class BrewService {
 
     /// 解析 `brew info --json=v2 --cask …` 输出的 auto_updates 字段(token → Bool)。
     /// 单独抽成静态方法便于单测。返回空字典表示全部无法解析。
-    static func parseCaskAutoUpdates(fromInfoJSON json: String) -> [String: Bool] {
+    nonisolated static func parseCaskAutoUpdates(fromInfoJSON json: String) -> [String: Bool] {
         struct InfoPayload: Decodable {
             struct Cask: Decodable {
                 let token: String
@@ -191,6 +210,11 @@ final class BrewService {
         return Self.parseCaskAutoUpdates(fromInfoJSON: out)
     }
 
+    /// 清理缓存(⑤ cleanup 阶段)。走闸门串行。
+    func cleanupAll() async -> Bool {
+        await brewOutput(["cleanup", "--prune=all"], timeout: 300) != nil
+    }
+
     /// 阶段1:下载单个包(流式,带进度事件)。
     /// - `onProgress`: 收到 progress 帧时回调,含已下载/总量/速度
     /// - 下载期间用**定时器独立轮询**缓存文件大小算速度(不依赖 brew 输出事件频率)
@@ -200,44 +224,48 @@ final class BrewService {
     @MainActor
     func fetch(package: OutdatedEntry, onLine: @escaping (String) -> Void, onProgress: @escaping (Int64, Int64, Double) -> Void) async throws {
         let flag = package.kind == .formula ? "--formula" : "--cask"
-        let proc = StreamedProcess(brewArguments: ["fetch", flag, package.name])
-        // 先探测包大小(HEAD,async 等待期间不阻塞调用线程)
+        // ① 先探测包大小:info 查询过闸门 + HEAD 网络请求(不占闸门)。
+        //    必须在下载主体前完成——闸门内不能再调 runSerialized(actor 不可重入,会死锁)
         var total: Int64 = 0
         if let json = try? await runSerialized(["info", "--json=v2", flag, package.name]),
            let url = Self.extractDownloadURL(fromInfoJSON: json) {
             total = await Self.probeDownloadSize(urlString: url) ?? 0
         }
-        // 独立定时器轮询缓存文件大小算速度(不依赖 brew 输出事件频率)
-        let poll = PollingMonitor(packageName: package.name, kind: package.kind, interval: 0.6) { bytes, speed in
-            onProgress(bytes, total, speed)
-        }
-        poll.start()
-        var lastBytes: Int64 = 0
-        var reportedOnce = false
-        do {
-            for try await event in proc.run() {
-                onLine(event.text)
-                // 保留流内采样,作为定时器之外的一层兜底(缓存已就绪但极早结束的场景)
-                if let size = poll.sample() {
-                    lastBytes = size
-                    reportedOnce = true
-                }
+        // ② 下载主体:整个下载期间持有闸门(期间其他 brew 命令排队等待)
+        try await withBrewGate {
+            let proc = StreamedProcess(brewArguments: ["fetch", flag, package.name])
+            // 独立定时器轮询缓存文件大小算速度(不依赖 brew 输出事件频率)
+            let poll = PollingMonitor(packageName: package.name, kind: package.kind, interval: 0.6) { bytes, speed in
+                onProgress(bytes, total, speed)
             }
-        } catch {
+            poll.start()
+            var lastBytes: Int64 = 0
+            var reportedOnce = false
+            do {
+                for try await event in proc.run() {
+                    onLine(event.text)
+                    // 保留流内采样,作为定时器之外的一层兜底(缓存已就绪但极早结束的场景)
+                    if let size = poll.sample() {
+                        lastBytes = size
+                        reportedOnce = true
+                    }
+                }
+            } catch {
+                poll.stop()
+                let finalBytes = reportedOnce ? lastBytes : 0
+                onProgress(finalBytes, total, 0)
+                throw error
+            }
             poll.stop()
-            let finalBytes = reportedOnce ? lastBytes : 0
-            onProgress(finalBytes, total, 0)
-            throw error
-        }
-        poll.stop()
-        // 结束时:上报当前缓存大小(下载完成后 .incomplete 改名为正式文件,最后一次采样已覆盖)
-        if let finalSize = BrewService.currentDownloadFileSize(packageName: package.name) {
-            onProgress(finalSize, total, 0)
-        } else if reportedOnce {
-            onProgress(lastBytes, total, 0)
-        } else {
-            // 无任何可见进度(极小文件或直接命中缓存):标记完成
-            onProgress(total, total, 0)
+            // 结束时:上报当前缓存大小(下载完成后 .incomplete 改名为正式文件,最后一次采样已覆盖)
+            if let finalSize = BrewService.currentDownloadFileSize(packageName: package.name) {
+                onProgress(finalSize, total, 0)
+            } else if reportedOnce {
+                onProgress(lastBytes, total, 0)
+            } else {
+                // 无任何可见进度(极小文件或直接命中缓存):标记完成
+                onProgress(total, total, 0)
+            }
         }
     }
 
@@ -245,13 +273,11 @@ final class BrewService {
     /// @MainActor:同理,onLine 在主线程执行
     @MainActor
     func install(package: OutdatedEntry, onLine: @escaping (String) -> Void) async throws {
-        if package.kind == .formula {
-            let proc = StreamedProcess(brewArguments: ["upgrade", "--formula", package.name])
-            for try await event in proc.run() {
-                onLine(event.text)
-            }
-        } else {
-            let proc = StreamedProcess(brewArguments: ["reinstall", "--cask", package.name])
+        try await withBrewGate {
+            let args: [String] = package.kind == .formula
+                ? ["upgrade", "--formula", package.name]
+                : ["reinstall", "--cask", package.name]
+            let proc = StreamedProcess(brewArguments: args)
             for try await event in proc.run() {
                 onLine(event.text)
             }
@@ -312,7 +338,7 @@ final class BrewService {
     /// - formula: `{"formulae":[{"name","versions":[...],"linked_version",...}],"casks":[]}`
     /// - cask: `{"formulae":[],"casks":[{"token","versions":[...],"pinned_version"}]}`
     /// - 与 parseOutdatedJSON 相同策略:先整段,失败再逐行从末尾找(兼容前导警告行)
-    static func parseInstalledList(_ json: String, kind: PackageKind) -> [InstalledPackage] {
+    nonisolated static func parseInstalledList(_ json: String, kind: PackageKind) -> [InstalledPackage] {
         struct Payload: Decodable {
             struct FormulaItem: Decodable { let name: String; let versions: [String]; let pinned_version: String? }
             struct CaskItem: Decodable { let token: String; let versions: [String]; let pinned_version: String? }
@@ -337,7 +363,7 @@ final class BrewService {
 
     /// 通用 JSON 解析 + 兜底:先整段;失败则从末尾向上逐行累积(处理前导警告/banner 后跟
     /// 单行紧凑 JSON 或多行格式化 JSON 的场景)。返回 nil 表示完全无法解析。
-    private static func decodeJSONWithFallback<T>(_ text: String, _ decode: (String) -> T?) -> T? {
+    private nonisolated static func decodeJSONWithFallback<T>(_ text: String, _ decode: (String) -> T?) -> T? {
         let all = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !all.isEmpty, let result = decode(all) { return result }
         // 从末尾向上累积:先试最后 1 行,再试最后 2 行…直到完整 JSON
@@ -369,7 +395,7 @@ final class BrewService {
 
     /// 解析 brew services list 的非 JSON 表格输出(兼容性最强)
     /// 表头:`Name  Status  User  File`
-    static func parseServicesOutput(_ text: String) -> [ServiceInfo] {
+    nonisolated static func parseServicesOutput(_ text: String) -> [ServiceInfo] {
         let lines = text.components(separatedBy: .newlines)
         guard lines.count > 1 else { return [] }
         // 跳过表头(含 Name/Status),解析后续行
@@ -397,7 +423,7 @@ final class BrewService {
     /// 定位单个包的下载缓存文件大小(字节)。
     /// - 优先 `.incomplete`(下载中);下载完成后文件被改名为正式文件名,兜底匹配。
     /// - 失败返回 nil(上层降级为只解析日志)
-    static func downloadFileBytes(packageName: String, kind: PackageKind) -> Int64? {
+    nonisolated static func downloadFileBytes(packageName: String, kind: PackageKind) -> Int64? {
         currentDownloadFileSize(packageName: packageName)
     }
 
@@ -405,7 +431,7 @@ final class BrewService {
     /// - 包名匹配:名称前缀包含包名(兼容 `xxx--<name>--...` 的 hash 文件名,也兼容明文 URL 文件名)
     /// - 下载中文件带 `.incomplete` 后缀;完成后改名为正式文件名
     /// - 过滤 `.json`(那是 API 元数据,不是包体)
-    static func currentDownloadFileSize(packageName: String) -> Int64? {
+    nonisolated static func currentDownloadFileSize(packageName: String) -> Int64? {
         guard let downloadsDir = brewDownloadsDirectory() else { return nil }
         guard let urls = try? FileManager.default.contentsOfDirectory(
             at: downloadsDir, includingPropertiesForKeys: [.fileSizeKey],
@@ -434,7 +460,7 @@ final class BrewService {
     }
 
     /// brew 下载缓存目录:$HOME/Library/Caches/Homebrew/downloads
-    static func brewDownloadsDirectory() -> URL? {
+    nonisolated static func brewDownloadsDirectory() -> URL? {
         let dir = URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent("Library/Caches/Homebrew/downloads")
         var isDir: ObjCBool = false
@@ -522,15 +548,5 @@ final class PollingMonitor {
     func stop() {
         timer?.cancel()
         timer = nil
-    }
-}
-/// brew 数据层错误
-enum BrewError: LocalizedError {
-    case busy
-
-    var errorDescription: String? {
-        switch self {
-        case .busy: return "另有 Homebrew 命令正在运行,请稍后重试"
-        }
     }
 }
