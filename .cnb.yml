@@ -1,5 +1,14 @@
 # CNB 流水线：开发阶段测试（Linux 容器）
 # 说明：brew audit 依赖 macOS Homebrew，CNB 无 macOS runner，该步在 GitHub Actions 补跑
+#
+# CNB→GitHub 实时同步(可选启用):
+#   GitHub 侧已有 sync-from-cnb.yml 每 6 小时定时同步(零凭据,已生效)。
+#   如需 push 到 CNB 后"实时"同步 GitHub,按以下两步启用:
+#     ① 网页在 blueteam0715 下新建【私有】仓库 keys,并在其根目录添加 env.yml:
+#          GITHUB_SYNC_USER: <GitHub用户名>
+#          GITHUB_SYNC_TOKEN: <GitHub PAT(repo权限)>
+#     ② 取消下方被注释的同步 job,推送到 CNB 即生效。
+#        (当前 CNB token 无建仓权限,须网页手动创建;也可直接一直用 GitHub 侧定时同步)
 main:
   push:
     - name: 测试
@@ -18,3 +27,31 @@ main:
           script: zsh -n brew-ua
         - name: 冒烟测试（stub brew，无网络依赖）
           script: zsh scripts/test.sh
+
+  # ↓↓↓ 启用实时同步时,取消本段注释(同时建好 keys 密钥仓库) ↓↓↓
+  # - name: 同步到 GitHub
+  #   imports: https://cnb.cool/blueteam0715/keys/-/blob/main/env.yml
+  #   docker:
+  #     image: python:3.12-slim
+  #   stages:
+  #     - name: 准备 git
+  #       script: |
+  #         export DEBIAN_FRONTEND=noninteractive
+  #         apt-get update -qq
+  #         apt-get install -y -qq git
+  #     - name: 全分支镜像推送
+  #       script: bash scripts/sync-github.sh
+  #
+  # "crontab: 0 */6 * * *":
+  #   - name: 定时兜底同步
+  #     imports: https://cnb.cool/blueteam0715/keys/-/blob/main/env.yml
+  #     docker:
+  #       image: python:3.12-slim
+  #     stages:
+  #       - name: 准备 git
+  #         script: |
+  #           export DEBIAN_FRONTEND=noninteractive
+  #           apt-get update -qq
+  #           apt-get install -y -qq git
+  #       - name: 全分支镜像推送
+  #         script: bash scripts/sync-github.sh

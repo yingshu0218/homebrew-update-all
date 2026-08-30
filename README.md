@@ -3,6 +3,20 @@
 Upgrade Homebrew formulae and casks one by one, with interactive and auto modes.
 A failed package never blocks the others — no more "one stuck download kills the whole batch".
 
+## BrewUA — the GUI companion
+
+**BrewUA** is a native SwiftUI macOS app (in `BrewUA/`) that brings the same two-phase upgrade strategy to a visual interface:
+
+- 🏪 **App-Store-style upgrade center** — check for updates, tick the ones you want, update selected or all
+- 📦 **Per-package progress** — download size (probed via HTTP HEAD), live speed, and status badges (waiting / downloading / downloaded / installing / done / failed)
+- 📚 **Package manager** — browse, search, upgrade, pin-badge, uninstall, and a "ignored only" filter
+- 🔒 **Upgrade ignore list** — shared with the CLI (`~/.config/brew-ua/ignored_casks`)
+- 🖥 **Services manager** — start/stop `brew services`
+- 🪞 **Mirror detection** — USTC / Tsinghua / Aliyun / official auto-detection (shell config aware)
+- 🏷 **Cask auto-update badge** — shows whether a cask updates itself (`auto_updates`)
+
+Build it from source with Xcode (project generated via `xcodegen` from `BrewUA/project.yml`). The GUI ships independently of the CLI versioning (GUI 1.x / CLI 1.8.x).
+
 ## Install
 
 ```bash
@@ -81,6 +95,13 @@ brew ua igl
 
 ## Changelog
 
+### v1.8.7 (2026-08-20)
+
+- 🖥 **BrewUA GUI** — native SwiftUI app with App-Store-style upgrade center, package manager, services manager and mirror detection
+- 🐛 **Crash fixes** — strict `@MainActor` isolation for all engine/service streams (background `@Published` mutation no longer possible)
+- ⚡ **Download UX** — per-package size via HTTP HEAD, live speed via cache-file polling, status badges per stage
+- 🔒 **Ignore list UI** — red lock toggle in the GUI + "ignored only" filter
+
 ### v1.8.5 (2026-08-13)
 
 - 🏗️ **Two-phase upgrade** – download every package first (with live speed, per-package timeout and failure isolation), then install the ones that downloaded OK. A single stuck download can no longer stall anything else
@@ -109,6 +130,11 @@ brew ua igl
 brew uninstall brew-update-all
 brew untap yingshu0218/update-all
 ```
+
+## CI
+
+- **CNB** (`.cnb.yml`) — zsh syntax check + smoke tests on every push (Linux container, fast feedback during development)
+- **GitHub Actions** — macOS runner: smoke tests, Formula structure check, `brew audit`; plus a scheduled job syncing all branches from the CNB development repo every 6 hours
 
 ## License
 

@@ -24,3 +24,8 @@ jobs:
           grep -q 'test do' Formula/brew-update-all.rb
           grep -qE '^  url "' Formula/brew-update-all.rb
           grep -qE '^  sha256 "' Formula/brew-update-all.rb
+
+      - name: brew audit（Homebrew 官方审计）
+        run: |
+          brew audit --formula --strict Formula/brew-update-all.rb || \
+          brew audit --formula Formula/brew-update-all.rb

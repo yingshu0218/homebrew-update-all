@@ -1,0 +1,26 @@
+name: Sync from CNB
+# CNB(开发仓库)→ GitHub(主仓库)全分支自动同步
+# CNB 是开发主战场,此 workflow 定时把 CNB 的全部分支/标签镜像到 GitHub 兜底;
+# 本地开发时也可 git push origin 直推 GitHub(秒级)。
+# 零凭据:brewua 为公开仓库拉取无需 token;push 使用仓库内置 GITHUB_TOKEN。
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # 每 6 小时兜底同步(UTC)
+  workflow_dispatch: # 支持在 Actions 页面手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取 CNB 仓库并推送全部分支
+        run: |
+          git clone --bare https://cnb.cool/blueteam0715/brewua.git cnb-mirror
+          cd cnb-mirror
+          # --all + --tags:同步全部分支与标签,不删除 GitHub 侧多余 refs(避免误删历史分支)
+          git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" --all
+          git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" --tags
+          echo "✓ CNB → GitHub 同步完成"
