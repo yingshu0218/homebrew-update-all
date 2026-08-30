@@ -7,29 +7,32 @@ enum PackageKind: String, Codable {
 }
 
 /// 一个已安装的包(包管理页数据)
+/// id 用 kind+name 稳定组合键(非 UUID):每次刷新列表时 SwiftUI 能 diff 复用行视图,避免整表重建闪烁
 struct InstalledPackage: Identifiable, Hashable {
-    let id = UUID()
     let name: String
     let version: String
     let kind: PackageKind
     var isPinned: Bool = false
+
+    var id: String { kind.rawValue + "/" + name }
 }
 
 /// 一个 brew services 服务(服务管理页)
 struct ServiceInfo: Identifiable, Hashable {
-    let id = UUID()
     let name: String
     let status: String
     let user: String
     let file: String
+
+    var id: String { name }
 
     /// 是否运行中(状态可能是 started / stopped / error / none)
     var isRunning: Bool { status.lowercased().hasPrefix("start") }
 }
 
 /// 一条待更新项(对应 brew outdated 的解析结果)
+/// id 用 kind+name 稳定组合键:检查更新后清单行可复用,不闪烁
 struct OutdatedEntry: Identifiable, Hashable {
-    let id = UUID()
     let name: String
     let currentVersion: String
     let newestVersion: String
@@ -37,6 +40,8 @@ struct OutdatedEntry: Identifiable, Hashable {
     var isIgnored: Bool
     /// 是否自更新应用(cask 的 auto_updates 字段;formula/未知时 nil)
     var autoUpdates: Bool?
+
+    var id: String { kind.rawValue + "/" + name }
 
     var displayVersion: String {
         "\(currentVersion) → \(newestVersion)"
@@ -63,8 +68,8 @@ enum TaskStatus: Equatable {
 }
 
 /// 单个包的升级任务可视化状态
+/// id 用 kind+name 稳定组合键(同一运行内每包一行;retryFailed 重建后 id 不变,行视图可复用)
 struct PackageTask: Identifiable {
-    let id = UUID()
     let name: String
     let kind: PackageKind
     var status: TaskStatus
@@ -73,6 +78,8 @@ struct PackageTask: Identifiable {
     var speedBytesPerSec: Double = 0
     var startedAt: Date?
     var finishedAt: Date?
+
+    var id: String { kind.rawValue + "/" + name }
 
     var durationText: String {
         guard let s = startedAt else { return "—" }

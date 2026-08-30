@@ -14,6 +14,10 @@ struct PackagesView: View {
     @State private var ignoredNames: Set<String> = []
     /// 「仅看屏蔽」:开启后列表只显示被屏蔽升级的包
     @State private var showIgnoredOnly = false
+    /// 卸载失败提示(弹窗)
+    @State private var uninstallError: String?
+    /// 正在卸载中的包名(防重复点击)
+    @State private var uninstallingName: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -22,6 +26,14 @@ struct PackagesView: View {
             content
         }
         .task { await load() }
+        .alert("卸载失败", isPresented: Binding(
+            get: { uninstallError != nil },
+            set: { if !$0 { uninstallError = nil } }
+        )) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(uninstallError ?? "")
+        }
     }
 
     // MARK: - 工具栏
@@ -98,6 +110,13 @@ struct PackagesView: View {
                 systemImage: "exclamationmark.triangle",
                 description: Text(errorMessage)
             )
+        } else if packages.isEmpty {
+            // 确实没装包:中性空状态(此前误走"加载失败"红色分支)
+            ContentUnavailableView(
+                "没有已安装的包",
+                systemImage: "shippingbox",
+                description: Text("当前没有已安装的软件包")
+            )
         } else if filtered.isEmpty {
             ContentUnavailableView(
                 "没有匹配的包",
@@ -109,6 +128,7 @@ struct PackagesView: View {
                 PackageRow(
                     package: pkg,
                     isIgnored: ignoredNames.contains(pkg.name),
+                    isUninstalling: uninstallingName == pkg.name,
                     onIgnore: { toggleIgnore(pkg) },
                     onUpgrade: { upgrade(pkg) },
                     onUninstall: { uninstall(pkg) }
@@ -143,10 +163,7 @@ struct PackagesView: View {
         let result = await brew.installedAllWithStatus()
         if result.success {
             packages = result.packages
-            // 空列表 = 确实没装包,不误报失败
-            if result.packages.isEmpty {
-                errorMessage = "当前没有已安装的软件包。"
-            }
+            // 空列表 = 确实没装包,走独立空状态分支,不误报失败
         } else {
             errorMessage = "未能读取已安装包列表。请确认 Homebrew 可用。"
         }
@@ -164,14 +181,24 @@ struct PackagesView: View {
     }
 
     private func uninstall(_ pkg: InstalledPackage) {
-        // 卸载走 brew uninstall,异步执行;确认弹窗由 SwiftUI confirmationDialog 触发
+        guard uninstallingName == nil else { return } // 防重复点击
+        uninstallingName = pkg.name
         let name = pkg.name
         Task {
             let flag = pkg.kind == .formula ? "--formula" : "--cask"
             let proc = StreamedProcess(brewArguments: ["uninstall", flag, name])
-            _ = try? await proc.runSync()
-            // 刷新列表
-            await load()
+            let result = await proc.runSyncChecked()
+            uninstallingName = nil
+            if result.success {
+                await load()
+            } else {
+                // 卸载失败必须让用户知道(此前 try? 静默吞掉,包删不掉无解释)
+                let reason = result.output
+                    .split(separator: "\n")
+                    .last { $0.contains("Error") || $0.contains("错误") }
+                    .map(String.init) ?? "brew uninstall 退出异常"
+                uninstallError = "\(name):\(reason)"
+            }
         }
     }
 
@@ -193,6 +220,7 @@ struct PackagesView: View {
 private struct PackageRow: View {
     let package: InstalledPackage
     let isIgnored: Bool
+    let isUninstalling: Bool
     let onIgnore: () -> Void
     let onUpgrade: () -> Void
     let onUninstall: () -> Void
@@ -256,9 +284,15 @@ private struct PackageRow: View {
             Button(role: .destructive) {
                 confirmUninstall = true
             } label: {
-                Image(systemName: "trash")
+                if isUninstalling {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "trash")
+                }
             }
             .buttonStyle(.borderless)
+            .disabled(isUninstalling)
             .help("卸载 \(package.name)")
             .confirmationDialog(
                 "确定卸载 \(package.name)?",

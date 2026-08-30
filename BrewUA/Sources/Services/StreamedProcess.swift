@@ -24,6 +24,97 @@ enum ProcessError: Error, LocalizedError {
     }
 }
 
+/// 行聚合器:跨 chunk 的 UTF-8 边界安全解码 + \r 作为行分隔。
+///
+/// 修复记录:
+/// - 旧实现 `String(data:encoding:.utf8)` 在多字节字符(中文/✔︎)被 chunk 边界截断时
+///   解码失败直接丢弃整块数据 → 改为只解码完整序列,尾部不完整字节留待下个 chunk。
+/// - 旧实现把 \r 全量替换为空,brew/curl 的 \r 刷新进度行会粘连成超长行 → 改为 \r 分行。
+final class LineAggregator {
+    private let lock = NSLock()
+    private var pendingData = Data()   // 尾部尚未解码的 UTF-8 不完整序列
+    private var lineBuffer = ""        // 已解码但未见行分隔符的文本
+    private let yield: (String) -> Void
+
+    init(yield: @escaping (String) -> Void) {
+        self.yield = yield
+    }
+
+    func consume(_ data: Data) {
+        guard !data.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        pendingData.append(data)
+        // 只解码完整 UTF-8 序列,尾部不完整字节留待下一个 chunk
+        let (safeLength, _) = Self.utf8SafeSplit(pendingData)
+        guard safeLength > 0,
+              let decoded = String(data: pendingData.prefix(safeLength), encoding: .utf8) else { return }
+        lineBuffer += decoded
+        pendingData = pendingData.count > safeLength ? Data(pendingData.suffix(pendingData.count - safeLength)) : Data()
+        flushLinesLocked()
+    }
+
+    /// 进程结束后调用:输出残余 buffer(无行分隔符结尾的最后一行)
+    func flush() {
+        lock.lock()
+        defer { lock.unlock() }
+        if !pendingData.isEmpty {
+            // 最后残余即使不完整也尽力解码(容错)
+            lineBuffer += String(data: pendingData, encoding: .utf8) ?? ""
+            pendingData = Data()
+        }
+        if !lineBuffer.isEmpty {
+            emitLocked(lineBuffer)
+            lineBuffer = ""
+        }
+    }
+
+    private func flushLinesLocked() {
+        while let newline = lineBuffer.firstIndex(of: "\n") {
+            emitLocked(String(lineBuffer[..<newline]))
+            lineBuffer.removeSubrange(...newline)
+        }
+    }
+
+    /// \r 也作为行分隔(brew/curl 进度刷新);纯空白行跳过
+    private func emitLocked(_ raw: String) {
+        for part in raw.split(separator: "\r", omittingEmptySubsequences: false) {
+            if !part.trimmingCharacters(in: .whitespaces).isEmpty {
+                yield(String(part))
+            }
+        }
+    }
+
+    /// 计算完整 UTF-8 前缀长度:尾部若是不完整的多字节序列则截出。
+    /// - Returns: (可安全解码的字节数, 尾部不完整字节数)
+    static func utf8SafeSplit(_ data: Data) -> (Int, Int) {
+        guard !data.isEmpty else { return (0, 0) }
+        let tail = [UInt8](data.suffix(4))
+        // 从尾往前找 UTF-8 序列起始字节(非 10xxxxxx continuation)
+        var startIdx: Int?
+        for (k, byte) in tail.enumerated().reversed() {
+            if byte & 0b1100_0000 != 0b1000_0000 {
+                startIdx = k
+                break
+            }
+        }
+        guard let k = startIdx else {
+            // 尾部 4 字节全是 continuation(异常),交由解码器容错
+            return (data.count, 0)
+        }
+        let byte = tail[k]
+        let expected: Int
+        if byte & 0b1000_0000 == 0 { return (data.count, 0) }            // ASCII 结尾,完整
+        else if byte & 0b1110_0000 == 0b1100_0000 { expected = 2 }
+        else if byte & 0b1111_0000 == 0b1110_0000 { expected = 3 }
+        else if byte & 0b1111_1000 == 0b1111_0000 { expected = 4 }
+        else { return (data.count, 0) }                                  // 非法起始字节,容错
+        let available = tail.count - k
+        if available >= expected { return (data.count, 0) }
+        return (data.count - available, available)
+    }
+}
+
 /// GUI 中统一运行 brew 子进程的封装。
 ///
 /// - 显式注入 PATH(macOS GUI 应用不继承 shell 环境,不注入找不到 brew)
@@ -37,6 +128,8 @@ final class StreamedProcess {
     var arguments: [String]
     var environment: [String: String]
     private(set) var process: Process?
+    /// 退出码(terminationHandler 触发后可读;nil = 尚未退出)
+    private(set) var terminationStatus: Int32?
 
     static let brewEnv: [String: String] = {
         var env = ProcessInfo.processInfo.environment
@@ -101,10 +194,21 @@ final class StreamedProcess {
             p.standardOutput = outPipe
             p.standardError = errPipe
 
+            let outAggregator = LineAggregator { continuation.yield(.stdout($0)) }
+            let errAggregator = LineAggregator { continuation.yield(.stderr($0)) }
+
             p.terminationHandler = { proc in
-                // 确保管道洪泛期间数据被消费完
+                self.terminationStatus = proc.terminationStatus
+                // 停止异步读取后,同步读完管道残余再收流。
+                // (旧实现直接置 nil 收流:内核缓冲里未消费的数据全部丢失,大 JSON 尾部被截断)
                 outPipe.fileHandleForReading.readabilityHandler = nil
                 errPipe.fileHandleForReading.readabilityHandler = nil
+                let outRest = outPipe.fileHandleForReading.readDataToEndOfFile()
+                let errRest = errPipe.fileHandleForReading.readDataToEndOfFile()
+                outAggregator.consume(outRest)
+                errAggregator.consume(errRest)
+                outAggregator.flush()
+                errAggregator.flush()
                 if proc.terminationStatus == 0 {
                     continuation.finish()
                 } else {
@@ -112,17 +216,15 @@ final class StreamedProcess {
                 }
             }
 
-            var outBuf = ""
-            var errBuf = ""
             outPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 guard !data.isEmpty else { return }
-                handleLines(data, buffer: &outBuf) { continuation.yield(.stdout($0)) }
+                outAggregator.consume(data)
             }
             errPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 guard !data.isEmpty else { return }
-                handleLines(data, buffer: &errBuf) { continuation.yield(.stderr($0)) }
+                errAggregator.consume(data)
             }
 
             do {
@@ -154,32 +256,63 @@ final class StreamedProcess {
         }
     }
 
-    /// 同步运行并聚合全部输出(用于 info/version 等轻量命令)。
-    /// 用 continuation 避免 DispatchSemaphore 阻塞;超时会取消并返回已收集内容。
-    func runSync(timeout: TimeInterval = 30) async throws -> String {
-        var collected = ""
-        let stream = run()
-        do {
-            for try await event in stream {
-                collected += event.text + "\n"
-            }
-        } catch {
-            // 非 0 退出也返回收集到输出(如 brew doctor),上层按输出判定
-        }
-        return collected
-    }
-}
+    // MARK: - 同步聚合
 
-private func handleLines(_ data: Data, buffer: inout String, yield: (String) -> Void) {
-    guard let str = String(data: data, encoding: .utf8) else { return }
-    buffer += str
-    while let newline = buffer.firstIndex(of: "\n") {
-        let line = String(buffer[..<newline])
-        buffer.removeSubrange(...newline)
-        // 去掉可能的 \r(brew 进度行常见),空行跳过
-        let cleaned = line.replacingOccurrences(of: "\r", with: "")
-        if !cleaned.isEmpty {
-            yield(cleaned)
+    /// 聚合运行公共实现:收集输出 + (可选)超时竞速。
+    /// - Returns: (全部输出, 退出是否成功;nil 表示超时被终止)
+    private func collect(timeout: TimeInterval?) async -> (output: String, success: Bool?) {
+        enum RaceOutcome {
+            case finished(String, Bool)
+            case timedOut
         }
+        let stream = run()
+        return await withTaskGroup(of: RaceOutcome.self) { group in
+            group.addTask {
+                var collected = ""
+                var ok = true
+                do {
+                    for try await event in stream {
+                        collected += event.text + "\n"
+                    }
+                } catch {
+                    // 非 0 退出也保留收集到的输出(如 brew doctor),上层按输出判定
+                    ok = false
+                }
+                return .finished(collected, ok)
+            }
+            if let timeout {
+                group.addTask {
+                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                    return .timedOut
+                }
+            }
+            let first = await group.next() ?? .timedOut
+            group.cancelAll()
+            switch first {
+            case .finished(let output, let ok):
+                return (output, ok)
+            case .timedOut:
+                // 超时:取消收集任务(取消触发 onTermination 杀进程组),等待其返回已收集部分
+                let partial = await group.next()
+                if case .finished(let output, _)? = partial {
+                    return (output, false)
+                }
+                return ("", false)
+            }
+        }
+    }
+
+    /// 同步运行并聚合全部输出(用于 info/version 等轻量命令)。
+    /// 超时会取消进程并返回已收集内容(旧语义保留:非 0 退出也返回输出,上层按输出判定)。
+    func runSync(timeout: TimeInterval = 30) async throws -> String {
+        let (output, _) = await collect(timeout: timeout)
+        return output
+    }
+
+    /// 同步运行并返回 (聚合输出, 是否成功退出)。
+    /// 需要区分成败的调用方(uninstall 等)用这个;超时/非 0 均判定为失败。
+    func runSyncChecked(timeout: TimeInterval = 120) async -> (output: String, success: Bool) {
+        let (output, success) = await collect(timeout: timeout)
+        return (output, success ?? false)
     }
 }

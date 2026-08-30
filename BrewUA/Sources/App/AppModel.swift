@@ -12,6 +12,8 @@ final class AppModel: ObservableObject {
     /// 待更新明细计数(formula/cask 分开),由 BrewService 刷新
     @Published var outdatedFormulaCount: Int = 0
     @Published var outdatedCaskCount: Int = 0
+    /// 待更新检测是否可信(false = 检测命令失败,数量不可信,UI 需明示而非当作 0)
+    @Published var outdatedReliable: Bool = true
     /// 环境信息
     @Published var brewPrefix: String = ""
     @Published var brewVersion: String = ""

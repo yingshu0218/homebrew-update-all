@@ -144,26 +144,21 @@ final class BrewService {
     }
 
     /// HEAD 请求下载地址,拿 `Content-Length`(字节)作为包总大小。失败返回 nil(调用侧降级)。
-    static func probeDownloadSize(urlString: String, timeout: TimeInterval = 15) -> Int64? {
+    /// async 实现:等待网络响应期间让出线程(修复旧 DispatchSemaphore 同步等待
+    /// 在 @MainActor 上最长卡主线程 16s 的问题)。
+    static func probeDownloadSize(urlString: String, timeout: TimeInterval = 15) async -> Int64? {
         guard let url = URL(string: urlString) else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
         request.timeoutInterval = timeout
         // 兼容部分 CDN 需要 UA,否则 403/404
         request.setValue("curl/8.7.1", forHTTPHeaderField: "User-Agent")
-        let semaphore = DispatchSemaphore(value: 0)
-        var result: Int64?
-        URLSession.shared.dataTask(with: request) { _, resp, _ in
-            if let http = resp as? HTTPURLResponse,
-               (200..<300).contains(http.statusCode),
-               let len = http.value(forHTTPHeaderField: "Content-Length"),
-               let bytes = Int64(len), bytes > 0 {
-                result = bytes
-            }
-            semaphore.signal()
-        }.resume()
-        _ = semaphore.wait(timeout: .now() + timeout + 1)
-        return result
+        guard let (_, resp) = try? await URLSession.shared.data(for: request),
+              let http = resp as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode),
+              let len = http.value(forHTTPHeaderField: "Content-Length"),
+              let bytes = Int64(len), bytes > 0 else { return nil }
+        return bytes
     }
 
     /// 解析 `brew info --json=v2 --cask …` 输出的 auto_updates 字段(token → Bool)。
@@ -206,11 +201,11 @@ final class BrewService {
     func fetch(package: OutdatedEntry, onLine: @escaping (String) -> Void, onProgress: @escaping (Int64, Int64, Double) -> Void) async throws {
         let flag = package.kind == .formula ? "--formula" : "--cask"
         let proc = StreamedProcess(brewArguments: ["fetch", flag, package.name])
-        // 先探测包大小(HEAD,非阻塞等待)
+        // 先探测包大小(HEAD,async 等待期间不阻塞调用线程)
         var total: Int64 = 0
         if let json = try? await runSerialized(["info", "--json=v2", flag, package.name]),
            let url = Self.extractDownloadURL(fromInfoJSON: json) {
-            total = Self.probeDownloadSize(urlString: url) ?? 0
+            total = await Self.probeDownloadSize(urlString: url) ?? 0
         }
         // 独立定时器轮询缓存文件大小算速度(不依赖 brew 输出事件频率)
         let poll = PollingMonitor(packageName: package.name, kind: package.kind, interval: 0.6) { bytes, speed in
@@ -287,16 +282,30 @@ final class BrewService {
     }
 
     /// 总览页聚合统计:已安装 formula/cask 数 + 待更新 formula/cask 数(串行避免 brew 互锁)。
-    func overviewStats() async -> (installedFormulae: Int, installedCasks: Int, outdatedFormulae: Int, outdatedCasks: Int) {
+    func overviewStats() async -> (installedFormulae: Int, installedCasks: Int, outdatedFormulae: Int, outdatedCasks: Int, outdatedReliable: Bool) {
         let packages = await installedAll()
         let ignored = config.loadIgnored()
-        let outdatedF = await outdatedFormulae()
-        let outdatedC = await outdatedCasks(greedy: false)
+        // outdated 检测失败(如 busy/命令异常)必须让上层知道,否则"检测失败"会被当成"没有更新"
+        var outdatedReliable = true
+        let outdatedF: [OutdatedEntry]
+        if let out = try? await runSerialized(["outdated", "--formula", "--json"]) {
+            outdatedF = Self.parseOutdatedJSON(out, kind: .formula)
+        } else {
+            outdatedF = []
+            outdatedReliable = false
+        }
+        let outdatedC: [OutdatedEntry]
+        if let out = try? await runSerialized(["outdated", "--cask", "--json"]) {
+            outdatedC = Self.parseOutdatedJSON(out, kind: .cask)
+        } else {
+            outdatedC = []
+            outdatedReliable = false
+        }
         let formulae = packages.filter { $0.kind == .formula }.count
         let casks = packages.filter { $0.kind == .cask }.count
         let outdatedFormulae = outdatedF.filter { !ignored.contains($0.name) }.count
         let outdatedCasks = outdatedC.filter { !ignored.contains($0.name) }.count
-        return (formulae, casks, outdatedFormulae, outdatedCasks)
+        return (formulae, casks, outdatedFormulae, outdatedCasks, outdatedReliable)
     }
 
     /// 解析 `brew list --json` 输出。

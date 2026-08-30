@@ -69,10 +69,12 @@ struct OverviewView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
-            metricCard("待更新", "\(appModel.outdatedCount)", icon: "arrow.triangle.2.circlepath", tint: appModel.outdatedCount > 0 ? .orange : .teal) {
-                Text("formulae \(appModel.outdatedFormulaCount) · casks \(appModel.outdatedCaskCount) · 已安装 \(appModel.installedFormulaCount + appModel.installedCaskCount) 个包")
+            metricCard("待更新", appModel.outdatedReliable ? "\(appModel.outdatedCount)" : "—", icon: "arrow.triangle.2.circlepath", tint: appModel.outdatedCount > 0 ? .orange : .teal) {
+                Text(appModel.outdatedReliable
+                    ? "formulae \(appModel.outdatedFormulaCount) · casks \(appModel.outdatedCaskCount) · 已安装 \(appModel.installedFormulaCount + appModel.installedCaskCount) 个包"
+                    : "检测失败(可能是升级任务占用中),点击重试")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(appModel.outdatedReliable ? Color.secondary : Color.orange)
             } onTap: {
                 appModel.selectedSection = .upgrade
             }
@@ -164,6 +166,7 @@ struct OverviewView: View {
                 self.appModel.outdatedCount = stat.outdatedFormulae + stat.outdatedCasks
                 self.appModel.outdatedFormulaCount = stat.outdatedFormulae
                 self.appModel.outdatedCaskCount = stat.outdatedCasks
+                self.appModel.outdatedReliable = stat.outdatedReliable
                 self.isLoading = false
             }
         }

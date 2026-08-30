@@ -194,17 +194,27 @@ final class UpdateEngine: ObservableObject {
 
     /// ① brew update + ② 列出待更新(过滤屏蔽),返回非空时也填充 pendingUpdates。
     /// 被 run()(直接升级)与 runCheckOnly()(仅检测)共用。
-    private func fetchOutdated(options: UpdateOptions) async -> [OutdatedEntry] {
-        // ① brew update
+    /// - Returns: nil = 本轮已终结(update 失败/取消,调用方直接 return,不再 finish)
+    private func fetchOutdated(options: UpdateOptions) async -> [OutdatedEntry]? {
+        // ① brew update:失败不能静默——用旧索引继续升级可能装到旧版本
         phase = .updatingTaps
         appendLog("① 更新 Homebrew 源…")
-        await servicesUpdate(onLine: { [weak self] in self?.appendLog("  " + $0) })
+        do {
+            try await services.update(onLine: { [weak self] in self?.appendLog("  " + $0) })
+        } catch is CancellationError {
+            return nil
+        } catch {
+            appendLog("✗ 更新 Homebrew 源失败:\(error.localizedDescription)")
+            appendLog("  为避免使用过期索引升级,本轮已中止。请检查网络后重试。")
+            finish(.failed("更新源失败:\(error.localizedDescription)"), summary: nil)
+            return nil
+        }
 
         // ② 列出待更新
         phase = .fetchingOutdated
         appendLog("② 检查待更新包…")
         let outdated = await services.outdatedAll(greedy: options.greedy)
-        guard !cancelFlag else { return [] }
+        guard !cancelFlag else { return nil }
 
         let ignoredNames = config.loadIgnored()
         var entries = filterOutIgnored(outdated, ignored: ignoredNames)
@@ -228,7 +238,11 @@ final class UpdateEngine: ObservableObject {
     /// 仅检测:update + outdated,把结果塞进 pendingUpdates 后结束(不下载不安装)。
     private func runCheckOnly(options: UpdateOptions) async {
         let startTime = Date()
-        let entries = await fetchOutdated(options: options)
+        guard let entries = await fetchOutdated(options: options) else {
+            // nil:更新源失败(fetchOutdated 已 finish)或用户取消(此处收尾)
+            if cancelFlag { finish(.canceled, summary: nil) }
+            return
+        }
         if cancelFlag {
             finish(.canceled, summary: nil)
             return
@@ -244,7 +258,11 @@ final class UpdateEngine: ObservableObject {
 
     private func run(options: UpdateOptions) async {
         let startTime = Date()
-        let entries = await fetchOutdated(options: options)
+        guard let entries = await fetchOutdated(options: options) else {
+            // nil:更新源失败(fetchOutdated 已 finish)或用户取消(此处收尾)
+            if cancelFlag { finish(.canceled, summary: nil) }
+            return
+        }
         if cancelFlag {
             finish(.canceled, summary: nil)
             return
@@ -423,10 +441,6 @@ final class UpdateEngine: ObservableObject {
     }
 
     // MARK: - 服务小封装(供日志共用)
-
-    private func servicesUpdate(onLine: @escaping (String) -> Void) async {
-        try? await services.update(onLine: onLine)
-    }
 
     func cleanup(onLog: @escaping (String) -> Void = { _ in }) async {
         appendLog("⑤ 清理缓存…")
