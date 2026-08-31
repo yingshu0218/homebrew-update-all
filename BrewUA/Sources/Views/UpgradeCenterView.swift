@@ -1,13 +1,15 @@
 import SwiftUI
 
 /// 升级中心:应用商店式体验——先"检查更新"得到待更新清单(可勾选),再"更新所选/全部更新"执行两阶段升级。
-/// 运行中展示任务进度、速度、失败隔离与摘要。
+/// 运行中展示任务进度、速度、失败隔离与摘要;「更新记录」面板回看持久化历史。
 struct UpgradeCenterView: View {
     @EnvironmentObject private var engine: UpdateEngine
 
     /// 勾选状态:包名 → 是否选中
     @State private var selectedNames: Set<String> = []
     @State private var greedy = false
+    /// 更新记录面板
+    @State private var showHistory = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -26,7 +28,7 @@ struct UpgradeCenterView: View {
                 actionBar
             } else {
                 ContentUnavailableView(
-                    "尚无更新记录",
+                    "尚无更新任务",
                     systemImage: "arrow.triangle.2.circlepath",
                     description: Text("先点击「检查更新」拉取最新待更新清单,再选择要更新的包。")
                 )
@@ -35,6 +37,9 @@ struct UpgradeCenterView: View {
         }
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .sheet(isPresented: $showHistory) {
+            HistorySheet()
+        }
         .onChange(of: engine.pendingUpdates.count) { _, _ in
             // 清单刷新时重置勾选(避免残留旧勾选)
             selectedNames = Set(engine.pendingUpdates.map(\.name))
@@ -65,6 +70,7 @@ struct UpgradeCenterView: View {
                 Toggle("包含自更新应用", isOn: $greedy)
                     .toggleStyle(.checkbox)
                     .font(.caption)
+                historyButton
                 Button {
                     engine.checkOnly(options: UpdateOptions(greedy: greedy))
                 } label: {
@@ -75,6 +81,7 @@ struct UpgradeCenterView: View {
                 Toggle("包含自更新应用", isOn: $greedy)
                     .toggleStyle(.checkbox)
                     .font(.caption)
+                historyButton
                 Button {
                     engine.checkOnly(options: UpdateOptions(greedy: greedy))
                 } label: {
@@ -94,6 +101,7 @@ struct UpgradeCenterView: View {
                         Label("重试失败 (\(engine.failedCount))", systemImage: "arrow.counterclockwise")
                     }
                 }
+                historyButton
                 Button {
                     engine.checkOnly(options: UpdateOptions(greedy: greedy))
                 } label: {
@@ -105,6 +113,15 @@ struct UpgradeCenterView: View {
                     Label("清空", systemImage: "trash")
                 }
             }
+        }
+    }
+
+    /// 更新记录入口:回看每次升级的持久化历史
+    private var historyButton: some View {
+        Button {
+            showHistory = true
+        } label: {
+            Label("更新记录", systemImage: "clock.arrow.circlepath")
         }
     }
 
@@ -479,5 +496,105 @@ private struct MainActionButtonStyle: ButtonStyle {
             )
             .scaleEffect(configuration.isPressed ? 0.97 : 1)
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+/// 更新记录面板:持久化的升级历史(新→旧),每条可展开查看包明细
+struct HistorySheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var records: [UpdateRecord] = []
+    @State private var confirmClear = false
+
+    private let history = HistoryService.shared
+    private let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f
+    }()
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if records.isEmpty {
+                    ContentUnavailableView(
+                        "暂无更新记录",
+                        systemImage: "clock.arrow.circlepath",
+                        description: Text("每次升级完成后会自动记录在这里")
+                    )
+                } else {
+                    List {
+                        ForEach(records) { record in
+                            recordRow(record)
+                        }
+                    }
+                    .listStyle(.inset)
+                }
+            }
+            .navigationTitle("更新记录")
+            .navigationSubtitle("\(records.count) 条记录")
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button("完成") { dismiss() }
+                }
+                ToolbarItem(placement: .destructiveAction) {
+                    Button("清空") { confirmClear = true }
+                        .disabled(records.isEmpty)
+                        .confirmationDialog(
+                            "确定清空全部更新记录?",
+                            isPresented: $confirmClear,
+                            titleVisibility: .visible
+                        ) {
+                            Button("清空", role: .destructive) {
+                                history.clear()
+                                records = []
+                            }
+                            Button("取消", role: .cancel) {}
+                        } message: {
+                            Text("历史记录将被永久删除,此操作不可撤销。")
+                        }
+                }
+            }
+        }
+        .frame(width: 520, height: 520)
+        .onAppear { records = history.load() }
+    }
+
+    private func recordRow(_ record: UpdateRecord) -> some View {
+        DisclosureGroup {
+            ForEach(record.entries, id: \.self) { entry in
+                HStack(spacing: 8) {
+                    Image(systemName: entry.success ? "checkmark.circle.fill" : "xmark.circle.fill")
+                        .foregroundStyle(entry.success ? Color.green : Color.red)
+                        .font(.caption)
+                    Text(entry.name)
+                        .font(.callout)
+                        .lineLimit(1)
+                    KindBadge(kind: entry.kind)
+                    Text("\(entry.fromVersion) → \(entry.toVersion)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if !entry.detail.isEmpty {
+                        Text(entry.detail)
+                            .font(.caption2)
+                            .foregroundStyle(.red.opacity(0.8))
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.vertical, 1)
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: record.failedCount == 0 ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                    .foregroundStyle(record.failedCount == 0 ? Color.green : Color.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(dateFormatter.string(from: record.date))
+                        .font(.callout.weight(.medium))
+                    Text("\(record.summaryText) · 共 \(record.entries.count) 个包")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+        }
     }
 }

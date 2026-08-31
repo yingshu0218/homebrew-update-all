@@ -44,6 +44,7 @@ targets:
       - path: Sources/Services/StreamedProcess.swift
       - path: Sources/Services/BrewGate.swift
       - path: Sources/Services/BrewService.swift
+      - path: Sources/Services/HistoryService.swift
       - path: Sources/Services/ConfigService.swift
       - path: Sources/Services/EnvDetector.swift
       - path: Sources/Models

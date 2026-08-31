@@ -159,3 +159,31 @@ struct RunSummary {
         return String(format: "%dm %02ds", secs / 60, secs % 60)
     }
 }
+
+// MARK: - 更新历史(持久化,升级中心"更新记录"面板)
+
+/// 单个包的历史记录条目
+struct RecordEntry: Codable, Hashable {
+    let name: String
+    let kind: PackageKind
+    let fromVersion: String
+    let toVersion: String
+    let success: Bool
+    /// 失败/超时/取消等原因;成功为空
+    let detail: String
+}
+
+/// 一次升级运行的历史记录
+struct UpdateRecord: Codable, Identifiable {
+    var id = UUID()
+    let date: Date
+    let entries: [RecordEntry]
+
+    var succeededCount: Int { entries.filter(\.success).count }
+    var failedCount: Int { entries.count - succeededCount }
+
+    var summaryText: String {
+        if failedCount == 0 { return "成功 \(succeededCount) 个" }
+        return "成功 \(succeededCount) · 失败 \(failedCount)"
+    }
+}

@@ -41,6 +41,9 @@ final class UpdateEngine: ObservableObject {
     private var runningTask: Task<Void, Never>?
     private let services: BrewServicing
     private let config = ConfigService.shared
+    private let history = HistoryService.shared
+    /// 包名 → 版本映射(构建历史记录用;upgrade/fetchOutdated 时填充,retryFailed 保留旧值)
+    private var versionMap: [String: (from: String, to: String)] = [:]
     /// 单包下载超时(秒),与 brew-ua 默认 600 一致
     var fetchTimeout: TimeInterval = Constants.fetchTimeout
 
@@ -81,6 +84,7 @@ final class UpdateEngine: ObservableObject {
         cancelFlag = false
         isRunning = true
         summary = nil
+        versionMap = [:]
         return true
     }
 
@@ -98,6 +102,7 @@ final class UpdateEngine: ObservableObject {
     /// 升级指定的包(两阶段:下载→安装)。
     func upgrade(packages: [OutdatedEntry], options: UpdateOptions = UpdateOptions()) {
         guard !packages.isEmpty, beginRun() else { return }
+        packages.forEach { versionMap[$0.name] = ($0.currentVersion, $0.newestVersion) }
         tasks = packages.map { PackageTask(name: $0.name, kind: $0.kind, status: .queued) }
         let startTime = Date()
         runningTask = Task { [weak self] in
@@ -225,6 +230,7 @@ final class UpdateEngine: ObservableObject {
                 }
             }
         }
+        entries.forEach { versionMap[$0.name] = ($0.currentVersion, $0.newestVersion) }
         pendingUpdates = entries
         return entries
     }
@@ -413,7 +419,34 @@ final class UpdateEngine: ObservableObject {
         if summary != nil {
             appendLog("== 升级结束 ==")
         }
+        recordHistory()
         isRunning = false
+    }
+
+    /// 把本轮任务结果写入持久化历史(升级中心"更新记录"面板回看)。
+    /// checkOnly(无任务)不记录;取消/超时/失败都如实记录。
+    private func recordHistory() {
+        guard !tasks.isEmpty else { return }
+        let entries = tasks.map { task -> RecordEntry in
+            let version = versionMap[task.name]
+            let detail: String
+            switch task.status {
+            case .failed(let reason): detail = reason
+            case .timeout: detail = "下载超时"
+            case .canceled: detail = "已取消"
+            case .queued: detail = "未执行"
+            default: detail = ""
+            }
+            return RecordEntry(
+                name: task.name,
+                kind: task.kind,
+                fromVersion: version?.from ?? "?",
+                toVersion: version?.to ?? "?",
+                success: task.status == .succeeded,
+                detail: detail
+            )
+        }
+        history.append(UpdateRecord(date: Date(), entries: entries))
     }
 
     private func buildSummary(startTime: Date) -> RunSummary {
