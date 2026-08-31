@@ -14,6 +14,11 @@ struct SettingsView: View {
     @State private var brewfileText = ""
     @State private var exportMessage: String?
 
+    @State private var cliStatus: CLIInstallStatus?
+    @State private var cliMessage: String?
+    @State private var isCLIBusy = false
+    @State private var showUninstallConfirm = false
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -22,6 +27,8 @@ struct SettingsView: View {
                 ignoredSection
                 Divider()
                 brewfileSection
+                Divider()
+                cliSection
             }
             .padding(20)
             .frame(maxWidth: 720, alignment: .leading)
@@ -33,6 +40,7 @@ struct SettingsView: View {
                 envInfo = await EnvDetector.detect()
                 isDetected = true
             }
+            await refreshCLIStatus()
         }
     }
 
@@ -208,6 +216,167 @@ struct SettingsView: View {
             } catch {
                 exportMessage = "生成失败:\(error.localizedDescription)"
             }
+        }
+    }
+
+    // MARK: - 命令行工具
+
+    private var cliSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionHeader("命令行工具", systemImage: "terminal", tint: .green)
+            Text("把 brew-ua CLI 安装到 $(brew --prefix)/bin,即可在终端直接运行 `brew ua` 逐个升级包(与 GUI 共用屏蔽列表与升级逻辑)。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if let status = cliStatus {
+                cliStatusRow(status)
+                cliActionRow(status)
+                if status.status == .installedForeign {
+                    Text("目标位置已有 brew-ua 但解析不到版本(可能来自 Homebrew formula)。重装将覆盖;若来自 formula,其升级时会再次覆盖。")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            } else {
+                ProgressView("检测中…")
+                    .font(.caption)
+            }
+
+            if let message = cliMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .confirmationDialog("卸载 brew-ua CLI?", isPresented: $showUninstallConfirm, titleVisibility: .visible) {
+            Button("卸载", role: .destructive) { uninstallCLI() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将从 $(brew --prefix)/bin 中移除 brew-ua,不影响 Homebrew 本身。")
+        }
+    }
+
+    @ViewBuilder
+    private func cliStatusRow(_ status: CLIInstallStatus) -> some View {
+        let info: (text: String, tint: Color) = {
+            switch status.status {
+            case .installed(let version):
+                if status.isOutdated, let latest = status.bundledVersion {
+                    return ("已安装 v\(version) · 可更新到 v\(latest)", .orange)
+                }
+                return ("已安装 v\(version)", .green)
+            case .installedForeign:
+                return ("已安装(来源未知)", .orange)
+            case .notInstalled:
+                return ("未安装", .secondary)
+            case .brewNotFound:
+                return ("未找到 Homebrew", .red)
+            }
+        }()
+        HStack(spacing: 16) {
+            Label(info.text, systemImage: "terminal")
+                .font(.body.weight(.medium))
+                .foregroundStyle(info.tint)
+            Spacer()
+            if let url = status.targetURL {
+                Text(url.path)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .help(url.path)
+            }
+        }
+        .padding(12)
+        .cardBackground(cornerRadius: 12)
+    }
+
+    @ViewBuilder
+    private func cliActionRow(_ status: CLIInstallStatus) -> some View {
+        HStack(spacing: 8) {
+            switch status.status {
+            case .notInstalled:
+                Button {
+                    installCLI()
+                } label: {
+                    Label("安装 brew-ua", systemImage: "arrow.down.circle")
+                }
+                .disabled(isCLIBusy)
+            case .installed:
+                if status.isOutdated, let latest = status.bundledVersion {
+                    Button {
+                        installCLI()
+                    } label: {
+                        Label("更新到 v\(latest)", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .disabled(isCLIBusy)
+                } else {
+                    Button {
+                        installCLI()
+                    } label: {
+                        Label("重装", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .disabled(isCLIBusy)
+                }
+                Button(role: .destructive) {
+                    showUninstallConfirm = true
+                } label: {
+                    Label("卸载", systemImage: "trash")
+                }
+                .disabled(isCLIBusy)
+            case .installedForeign:
+                Button {
+                    installCLI()
+                } label: {
+                    Label("重装(覆盖)", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .disabled(isCLIBusy)
+                Button(role: .destructive) {
+                    showUninstallConfirm = true
+                } label: {
+                    Label("卸载", systemImage: "trash")
+                }
+                .disabled(isCLIBusy)
+            case .brewNotFound:
+                EmptyView()
+            }
+            if isCLIBusy {
+                ProgressView()
+                    .controlSize(.small)
+            }
+        }
+    }
+
+    private func refreshCLIStatus() async {
+        cliStatus = await CLIInstallerService.checkStatus()
+    }
+
+    private func installCLI() {
+        Task {
+            isCLIBusy = true
+            cliMessage = "正在安装…"
+            do {
+                let version = try await CLIInstallerService.install()
+                cliMessage = "已安装 brew-ua v\(version),在终端运行 `brew ua` 即可使用(新开终端窗口生效)"
+            } catch {
+                cliMessage = "安装失败:\(error.localizedDescription)"
+            }
+            isCLIBusy = false
+            await refreshCLIStatus()
+        }
+    }
+
+    private func uninstallCLI() {
+        Task {
+            isCLIBusy = true
+            cliMessage = "正在卸载…"
+            do {
+                try await CLIInstallerService.uninstall()
+                cliMessage = "已卸载 brew-ua"
+            } catch {
+                cliMessage = "卸载失败:\(error.localizedDescription)"
+            }
+            isCLIBusy = false
+            await refreshCLIStatus()
         }
     }
 

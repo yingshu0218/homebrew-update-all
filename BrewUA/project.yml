@@ -19,6 +19,9 @@ targets:
     platform: macOS
     sources:
       - Sources
+      # brew-ua CLI 脚本打进资源(直接引用仓库根脚本,单一来源免同步)
+      - path: ../brew-ua
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.brewua.app
@@ -47,8 +50,12 @@ targets:
       - path: Sources/Services/HistoryService.swift
       - path: Sources/Services/ConfigService.swift
       - path: Sources/Services/EnvDetector.swift
+      - path: Sources/Services/CLIInstallerService.swift
       - path: Sources/Models
       - path: Sources/Engine
+      # 测试 bundle 同样注册脚本资源,供 CLIInstallerService 资源解析用例使用
+      - path: ../brew-ua
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.brewua.tests
