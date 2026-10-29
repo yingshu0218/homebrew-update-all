@@ -14,6 +14,7 @@ final class AppModel: ObservableObject {
     @Published var outdatedCaskCount: Int = 0
     /// 待更新检测是否可信(false = 检测命令失败,数量不可信,UI 需明示而非当作 0)
     @Published var outdatedReliable: Bool = true
+    @Published var installedReliable: Bool = true
     /// 当前选择的分区(供跨页跳转,如总览→升级中心)
     @Published var selectedSection: AppSection? = .overview
 

@@ -70,7 +70,7 @@ final class LineAggregator {
     }
 
     private func flushLinesLocked() {
-        while let newline = lineBuffer.firstIndex(of: "\n") {
+        while let newline = lineBuffer.firstIndex(where: { $0 == "\n" || $0 == "\r" || $0 == "\r\n" }) {
             emitLocked(String(lineBuffer[..<newline]))
             lineBuffer.removeSubrange(...newline)
         }

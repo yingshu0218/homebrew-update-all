@@ -270,7 +270,7 @@ struct UpgradeCenterView: View {
                 .frame(maxHeight: 140)
                 .background(.quaternary.opacity(0.2))
                 .clipShape(RoundedRectangle(cornerRadius: 8))
-                .onChange(of: engine.eventLog.count) { _, _ in
+                .onChange(of: engine.logRevision) { _, _ in
                     withAnimation(.easeOut(duration: 0.2)) {
                         proxy.scrollTo("log-bottom", anchor: .bottom)
                     }

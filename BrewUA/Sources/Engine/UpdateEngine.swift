@@ -37,18 +37,22 @@ final class UpdateEngine: ObservableObject {
     /// 上次"仅检测"得到的待更新清单(升级中心据此展示勾选式列表)
     @Published private(set) var pendingUpdates: [OutdatedEntry] = []
 
+    static let maxLogLines = 2000
+    @Published private(set) var logRevision: UInt64 = 0
+
     private var cancelFlag = false
     private var runningTask: Task<Void, Never>?
     private let services: BrewServicing
     private let config = ConfigService.shared
-    private let history = HistoryService.shared
+    private let history: HistoryService
     /// 包名 → 版本映射(构建历史记录用;upgrade/fetchOutdated 时填充,retryFailed 保留旧值)
     private var versionMap: [String: (from: String, to: String)] = [:]
     /// 单包下载超时(秒),与 brew-ua 默认 600 一致
     var fetchTimeout: TimeInterval = Constants.fetchTimeout
 
-    init(services: BrewServicing = BrewService.shared) {
-        self.services = services
+    init(services: BrewServicing? = nil, history: HistoryService? = nil) {
+        self.services = services ?? BrewService.shared
+        self.history = history ?? HistoryService.shared
     }
 
     /// 供 UI 渲染工具/预览注入假数据视图状态(生产代码不调用)。
@@ -93,7 +97,6 @@ final class UpdateEngine: ObservableObject {
     func checkOnly(options: UpdateOptions = UpdateOptions()) {
         guard beginRun() else { return }
         tasks = []
-        pendingUpdates = []
         runningTask = Task { [weak self] in
             await self?.runCheckOnly(options: options)
         }
@@ -131,24 +134,19 @@ final class UpdateEngine: ObservableObject {
         appendLog("用户请求取消…")
     }
 
-    /// 追加一条运行日志。类本身是 @MainActor,但 closure 回调路径
-    /// (BrewService.fetch/install/update 的 onLine 在后台 stream 恢复点执行)
-    /// 可能从后台线程进来,必须切回主线程再改 @Published,否则触发
-    /// SwiftUI 后台重建主菜单崩溃(SIGABRT)。
+    /// 所有调用经 MainActor 隔离，内存仅保留最近 maxLogLines 行。
     func appendLog(_ line: String) {
-        if Thread.isMainThread {
-            eventLog.append(line)
-        } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.eventLog.append(line)
-            }
+        eventLog.append(line)
+        if eventLog.count > Self.maxLogLines {
+            eventLog.removeFirst(eventLog.count - Self.maxLogLines)
         }
+        logRevision &+= 1
     }
 
-    /// 升级后清理:移除已不在待更新清单里且已成功/取消的包。
+    /// 升级后仅移除成功的包；取消和失败的包仍可继续升级。
     /// 保持 pendingUpdates 反映"此刻还剩哪些可更新"。
     private func prunePendingAfterRun() {
-        let done = Set(tasks.filter { $0.status == .succeeded || $0.status == .canceled }.map(\.name))
+        let done = Set(tasks.filter { $0.status == .succeeded }.map(\.name))
         pendingUpdates = pendingUpdates.filter { !done.contains($0.name) }
     }
 
@@ -212,7 +210,14 @@ final class UpdateEngine: ObservableObject {
         // ② 列出待更新
         phase = .fetchingOutdated
         appendLog("② 检查待更新包…")
-        let outdated = await services.outdatedAll(greedy: options.greedy)
+        let outdated: [OutdatedEntry]
+        do {
+            outdated = try await services.outdatedAll(greedy: options.greedy)
+        } catch {
+            appendLog("✗ 检查更新失败: \(error.localizedDescription)")
+            finish(.failed("检查更新失败: \(error.localizedDescription)"), summary: nil)
+            return nil
+        }
         guard !cancelFlag else { return nil }
 
         let ignoredNames = config.loadIgnored()
@@ -285,6 +290,7 @@ final class UpdateEngine: ObservableObject {
     /// internal 便于测试注入 mock 直接驱动状态机。
     /// 任务列表在本方法初始化(retryFailed 预置重试清单时 tasks 非空,不覆盖)。
     func runPhase1And2(entries: [OutdatedEntry], startTime: Date) async {
+        defer { prunePendingAfterRun() }
         if tasks.isEmpty {
             tasks = entries.map { PackageTask(name: $0.name, kind: $0.kind, status: .queued) }
         }
@@ -361,7 +367,6 @@ final class UpdateEngine: ObservableObject {
         phase = .cleanup
         await cleanup()
 
-        prunePendingAfterRun()
         finish(.finished, summary: buildSummary(startTime: startTime))
     }
 

@@ -71,7 +71,7 @@ struct OverviewView: View {
             }
             metricCard("待更新", appModel.outdatedReliable ? "\(appModel.outdatedCount)" : "—", icon: "arrow.triangle.2.circlepath", tint: appModel.outdatedCount > 0 ? .orange : .teal) {
                 Text(appModel.outdatedReliable
-                    ? "formulae \(appModel.outdatedFormulaCount) · casks \(appModel.outdatedCaskCount) · 已安装 \(appModel.installedFormulaCount + appModel.installedCaskCount) 个包"
+                    ? "formulae \(appModel.outdatedFormulaCount) · casks \(appModel.outdatedCaskCount) · \(appModel.installedReliable ? "已安装 \(appModel.installedFormulaCount + appModel.installedCaskCount) 个包" : "已安装数量读取失败")"
                     : "检测失败(可能是升级任务占用中),点击重试")
                     .font(.caption2)
                     .foregroundStyle(appModel.outdatedReliable ? Color.secondary : Color.orange)
@@ -155,11 +155,16 @@ struct OverviewView: View {
         let (env, stat) = await (info, stats)
         guard !Task.isCancelled else { return }
         envInfo = env
-        appModel.installedFormulaCount = stat.installedFormulae
-        appModel.installedCaskCount = stat.installedCasks
-        appModel.outdatedCount = stat.outdatedFormulae + stat.outdatedCasks
-        appModel.outdatedFormulaCount = stat.outdatedFormulae
-        appModel.outdatedCaskCount = stat.outdatedCasks
+        appModel.installedReliable = stat.installedReliable
+        if stat.installedReliable {
+            appModel.installedFormulaCount = stat.installedFormulae
+            appModel.installedCaskCount = stat.installedCasks
+        }
+        if stat.outdatedReliable {
+            appModel.outdatedCount = stat.outdatedFormulae + stat.outdatedCasks
+            appModel.outdatedFormulaCount = stat.outdatedFormulae
+            appModel.outdatedCaskCount = stat.outdatedCasks
+        }
         appModel.outdatedReliable = stat.outdatedReliable
     }
 }

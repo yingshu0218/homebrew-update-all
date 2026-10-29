@@ -607,7 +607,6 @@ function _show_cursor() {
 
 function _cleanup_and_exit() {
   _show_cursor
-  [[ -n "${LOCK_FILE:-}" ]] && rm -f "$LOCK_FILE"
   echo ""
   exit 130
 }
@@ -969,19 +968,17 @@ TMP_BASE=$(mktemp -d "${TMPDIR:-/tmp}/brew-ua.XXXXXX" 2>/dev/null)
 # 当前版本（发版时同步更新；版本自检用）
 BREW_UA_VERSION="1.8.7"
 
-# 单实例锁：PID 文件 + kill -0 探测，陈旧锁自动清理
+# 原子 advisory lock：退出或崩溃时由内核释放。锁文件保留，避免删除后出现两个 inode 的竞争。
 LOCK_FILE="$HOME/.config/brew-ua/brew-ua.lock"
 mkdir -p "$HOME/.config/brew-ua"
-if [[ -f "$LOCK_FILE" ]]; then
-  local old_pid=$(cat "$LOCK_FILE" 2>/dev/null)
-  if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-    echo "${C_ERROR}  ✗ 已有 brew-ua 实例在运行（PID $old_pid），请稍后再试${C_RESET}"
-    echo "${C_MUTED}    若确认无其他实例，可删除 ${LOCK_FILE} 后重试${C_RESET}"
-    exit 1
-  fi
-  rm -f "$LOCK_FILE"
+if ! zmodload zsh/system || ! touch "$LOCK_FILE"; then
+  echo "${C_ERROR}  ✗ 无法初始化升级锁${C_RESET}"
+  exit 1
 fi
-echo $$ > "$LOCK_FILE"
+if ! zsystem flock -t 0 -f LOCK_FD "$LOCK_FILE"; then
+  echo "${C_ERROR}  ✗ 已有 brew-ua 实例在运行，请稍后再试${C_RESET}"
+  exit 1
+fi
 
 total_start=$(date +%s)
 
@@ -1597,9 +1594,7 @@ if [[ -n "$LATEST_TAG" && "$LATEST_TAG" != "$BREW_UA_VERSION" && "$(printf '%s\n
   echo ""
 fi
 
-# 释放单实例锁
-rm -f "$LOCK_FILE"
-
+# 单实例锁随 shell 退出自动释放
 if (( fail_count > 0 )); then
   echo "${C_WARN}  ⚠  有 ${fail_count} 个包升级失败，可查看上方日志排查问题${C_RESET}"
   echo ""

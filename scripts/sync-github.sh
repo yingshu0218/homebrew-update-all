@@ -3,7 +3,7 @@
 #
 # 触发方式(见 .cnb.yml):
 #   1. push 到 CNB main 时实时同步
-#   2. 每 6 小时 crontab 兜底
+#   2. 每天 crontab 兜底（可选，见 .cnb.yml）
 #   3. .cnb/web_trigger.yml 网页按钮手动触发
 #
 # 依赖环境变量(由密钥仓库 blueteam0715/keys 的 env.yml imports 提供):

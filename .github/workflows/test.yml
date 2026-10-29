@@ -17,6 +17,9 @@ jobs:
       - name: 冒烟测试（stub brew，无网络）
         run: zsh scripts/test.sh
 
+      - name: CLI 并发启动与崩溃释放锁
+        run: python3 scripts/test-cli-lock.py
+
       - name: Formula 校验（语法 + 结构，不依赖 tap 信任）
         run: |
           ruby -c Formula/brew-update-all.rb
@@ -27,5 +30,9 @@ jobs:
 
       - name: brew audit（Homebrew 官方审计）
         run: |
-          brew audit --formula --strict Formula/brew-update-all.rb || \
-          brew audit --formula Formula/brew-update-all.rb
+          # Homebrew 已移除按文件路径审计，先放入本地 tap，再按完整名称审计。
+          brew tap-new --no-git local/ci
+          cp Formula/brew-update-all.rb "$(brew --repository local/ci)/Formula/"
+          brew trust local/ci
+          brew audit --formula --strict local/ci/brew-update-all || \
+          brew audit --formula local/ci/brew-update-all

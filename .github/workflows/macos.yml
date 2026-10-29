@@ -1,0 +1,37 @@
+name: macOS App
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'BrewUA/**'
+      - 'brew-ua'
+      - '.github/workflows/macos.yml'
+  pull_request:
+    paths:
+      - 'BrewUA/**'
+      - 'brew-ua'
+      - '.github/workflows/macos.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate --spec BrewUA/project.yml
+      - name: Build app and run unit tests
+        run: >-
+          xcodebuild test
+          -project BrewUA/BrewUA.xcodeproj
+          -scheme BrewUA
+          -destination 'platform=macOS'
+          -derivedDataPath "$RUNNER_TEMP/BrewUA-DerivedData"
+          CODE_SIGNING_ALLOWED=NO

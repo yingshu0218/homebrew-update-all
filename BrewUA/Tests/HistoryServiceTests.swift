@@ -1,5 +1,4 @@
 import XCTest
-@testable import BrewUA
 
 /// 更新历史服务测试:临时文件 round-trip、条数裁剪、清空。
 final class HistoryServiceTests: XCTestCase {

@@ -2,7 +2,7 @@
 # 说明：brew audit 依赖 macOS Homebrew，CNB 无 macOS runner，该步在 GitHub Actions 补跑
 #
 # CNB→GitHub 实时同步(可选启用):
-#   GitHub 侧已有 sync-from-cnb.yml 每 6 小时定时同步(零凭据,已生效)。
+#   GitHub 侧 sync-from-cnb.yml 每天检查一次，有变化才同步(零凭据)。
 #   如需 push 到 CNB 后"实时"同步 GitHub,按以下两步启用:
 #     ① 网页在 blueteam0715 下新建【私有】仓库 keys,并在其根目录添加 env.yml:
 #          GITHUB_SYNC_USER: <GitHub用户名>
@@ -42,7 +42,7 @@ main:
   #     - name: 全分支镜像推送
   #       script: bash scripts/sync-github.sh
   #
-  # "crontab: 0 */6 * * *":
+  # "crontab: 17 1 * * *":
   #   - name: 定时兜底同步
   #     imports: https://cnb.cool/blueteam0715/keys/-/blob/main/env.yml
   #     docker:

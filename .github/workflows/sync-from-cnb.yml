@@ -6,21 +6,63 @@ name: Sync from CNB
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # 每 6 小时兜底同步(UTC)
+    - cron: '17 1 * * *' # 每天北京时间 09:17 检查一次（UTC 01:17）
   workflow_dispatch: # 支持在 Actions 页面手动触发
 
 permissions:
   contents: write
 
+concurrency:
+  group: sync-from-cnb
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: 拉取 CNB 仓库并推送全部分支
+      - name: 检查 CNB 分支与标签是否有变化
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          export LC_ALL=C
+          git ls-remote --refs --heads --tags https://cnb.cool/blueteam0715/brewua.git | sort > cnb-refs
+          git ls-remote --refs --heads --tags "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" | sort > github-refs
+          if [[ -z "$(comm -23 cnb-refs github-refs)" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "CNB 没有新增或变化的分支、标签，无需同步"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 拉取 CNB 仓库并推送全部分支
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
           git clone --bare https://cnb.cool/blueteam0715/brewua.git cnb-mirror
           cd cnb-mirror
-          # --all + --tags:同步全部分支与标签,不删除 GitHub 侧多余 refs(避免误删历史分支)
-          git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" --all
-          git push "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" --tags
+          git remote add github "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git fetch --no-tags github '+refs/heads/*:refs/remotes/github/*'
+          # GitHub 可能有独立提交（如 LICENSE、Formula 自动更新）。只做快进，绝不覆盖。
+          while IFS= read -r ref; do
+            branch="${ref#refs/heads/}"
+            target="refs/remotes/github/${branch}"
+            if ! git show-ref --verify --quiet "$target"; then
+              git push github "$ref:$ref"
+            elif git merge-base --is-ancestor "$ref" "$target"; then
+              echo "跳过 ${branch}: GitHub 已包含 CNB 的全部提交"
+            elif git merge-base --is-ancestor "$target" "$ref"; then
+              git push github "$ref:$ref"
+            else
+              echo "::error::${branch} 已分叉，请先将 GitHub 的独立提交合并回 CNB"
+              exit 1
+            fi
+          done < <(git for-each-ref --format='%(refname)' refs/heads/)
+          # 只推送新增或变化的标签；同名标签冲突仍由 Git 拒绝。
+          while read -r sha ref; do
+            if ! grep -Fqx "${sha}"$'\t'"${ref}" ../github-refs; then
+              git push github "$ref:$ref"
+            fi
+          done < <(git for-each-ref --format='%(objectname) %(refname)' refs/tags/)
           echo "✓ CNB → GitHub 同步完成"

@@ -9,12 +9,14 @@ final class UpdateEngineFlowTests: XCTestCase {
 
     private final class MockBrew: BrewServicing {
         var updateError: Error?
+        var outdatedError: Error?
         var outdatedResult: [OutdatedEntry] = []
         var failingPackages: Set<String> = []
         var fetchDelay: TimeInterval = 0
         var autoFlags: [String: Bool] = [:]
         /// fetch 收到输出行时的回调(模拟运行中用户点取消)
         var onFetchLine: (() -> Void)?
+        var onInstall: (() -> Void)?
         private(set) var fetchedNames: [String] = []
         private(set) var installedNames: [String] = []
         private(set) var cleanupCalled = false
@@ -23,8 +25,9 @@ final class UpdateEngineFlowTests: XCTestCase {
             if let updateError { throw updateError }
         }
 
-        func outdatedAll(greedy: Bool) async -> [OutdatedEntry] {
-            outdatedResult
+        func outdatedAll(greedy: Bool) async throws -> [OutdatedEntry] {
+            if let outdatedError { throw outdatedError }
+            return outdatedResult
         }
 
         func fetch(package: OutdatedEntry, onLine: @escaping (String) -> Void, onProgress: @escaping (Int64, Int64, Double) -> Void) async throws {
@@ -43,6 +46,7 @@ final class UpdateEngineFlowTests: XCTestCase {
 
         func install(package: OutdatedEntry, onLine: @escaping (String) -> Void) async throws {
             installedNames.append(package.name)
+            onInstall?()
         }
 
         func caskAutoUpdates(names: [String]) async -> [String: Bool] {
@@ -63,12 +67,18 @@ final class UpdateEngineFlowTests: XCTestCase {
         OutdatedEntry(name: name, currentVersion: "1.0", newestVersion: "2.0", kind: kind, isIgnored: false)
     }
 
+    private func makeEngine(_ mock: MockBrew) -> UpdateEngine {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("brewua-flow-\(UUID().uuidString).json")
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return UpdateEngine(services: mock, history: HistoryService(fileURL: url))
+    }
+
     // MARK: - 用例
 
     /// 两阶段全流程:全部下载成功 → 全部安装成功 → cleanup 收尾
     func testHappyPath() async {
         let mock = MockBrew()
-        let engine = UpdateEngine(services: mock)
+        let engine = makeEngine(mock)
         await engine.runPhase1And2(entries: [entry("wget"), entry("jq")], startTime: Date())
 
         XCTAssertEqual(mock.fetchedNames, ["wget", "jq"], "阶段1按序逐包下载")
@@ -83,7 +93,7 @@ final class UpdateEngineFlowTests: XCTestCase {
     func testFetchFailureIsolation() async {
         let mock = MockBrew()
         mock.failingPackages = ["broken"]
-        let engine = UpdateEngine(services: mock)
+        let engine = makeEngine(mock)
         await engine.runPhase1And2(entries: [entry("broken"), entry("wget")], startTime: Date())
 
         XCTAssertEqual(mock.fetchedNames, ["broken", "wget"], "失败不阻断队列")
@@ -96,7 +106,7 @@ final class UpdateEngineFlowTests: XCTestCase {
     func testUpdateFailureAborts() async {
         let mock = MockBrew()
         mock.updateError = SimError()
-        let engine = UpdateEngine(services: mock)
+        let engine = makeEngine(mock)
         let result = await engine.fetchOutdated(options: UpdateOptions())
 
         XCTAssertNil(result, "update 失败应返回 nil 终止本轮")
@@ -109,7 +119,9 @@ final class UpdateEngineFlowTests: XCTestCase {
     /// 运行中取消:下载期间点取消 → 当前包标记 canceled,剩余包不再处理
     func testCancelDuringDownload() async {
         let mock = MockBrew()
-        let engine = UpdateEngine(services: mock)
+        let engine = makeEngine(mock)
+        mock.outdatedResult = [entry("wget"), entry("jq")]
+        _ = await engine.fetchOutdated(options: UpdateOptions())
         mock.onFetchLine = { engine.cancel() } // 模拟用户在下载第一个包时点「取消」
         mock.fetchDelay = 0.4
 
@@ -121,12 +133,13 @@ final class UpdateEngineFlowTests: XCTestCase {
         XCTAssertTrue(mock.installedNames.isEmpty, "取消后不进入安装阶段")
         XCTAssertEqual(engine.phase, .canceled)
         XCTAssertFalse(engine.isRunning)
+        XCTAssertEqual(engine.pendingUpdates.map(\.name), ["wget", "jq"], "取消的包仍应出现在待更新列表")
     }
 
     /// 超时熔断:单包下载超过 fetchTimeout → 标记 timeout,不进入安装阶段
     func testFetchTimeoutIsolation() async {
         let mock = MockBrew()
-        let engine = UpdateEngine(services: mock)
+        let engine = makeEngine(mock)
         engine.fetchTimeout = 0.3
         mock.fetchDelay = 2.0 // 每包挂起 2s,引擎 0.3s 即超时打断
 
@@ -136,4 +149,48 @@ final class UpdateEngineFlowTests: XCTestCase {
         XCTAssertTrue(mock.installedNames.isEmpty, "超时的包不进入安装阶段")
         XCTAssertEqual(engine.phase, .finished)
     }
+    func testQueryFailurePreservesPendingUpdates() async {
+        let mock = MockBrew()
+        mock.outdatedResult = [entry("wget")]
+        let engine = makeEngine(mock)
+        _ = await engine.fetchOutdated(options: UpdateOptions())
+        mock.outdatedError = SimError()
+        let result = await engine.fetchOutdated(options: UpdateOptions())
+        XCTAssertNil(result)
+        XCTAssertEqual(engine.pendingUpdates.map(\.name), ["wget"])
+        if case .failed = engine.phase {} else { XCTFail("查询失败不能显示为无更新") }
+        XCTAssertTrue(mock.fetchedNames.isEmpty)
+    }
+
+    func testSuccessfulPackagesRemovedFromPending() async {
+        let mock = MockBrew()
+        mock.outdatedResult = [entry("wget"), entry("broken")]
+        mock.failingPackages = ["broken"]
+        let engine = makeEngine(mock)
+        _ = await engine.fetchOutdated(options: UpdateOptions())
+        await engine.runPhase1And2(entries: mock.outdatedResult, startTime: Date())
+        XCTAssertEqual(engine.pendingUpdates.map(\.name), ["broken"])
+    }
+
+    func testLogIsBoundedAndKeepsLatestLines() {
+        let engine = makeEngine(MockBrew())
+        for n in 0..<(UpdateEngine.maxLogLines + 10) { engine.appendLog("line \(n)") }
+        XCTAssertEqual(engine.eventLog.count, UpdateEngine.maxLogLines)
+        XCTAssertEqual(engine.eventLog.first, "line 10")
+        XCTAssertEqual(engine.eventLog.last, "line \(UpdateEngine.maxLogLines + 9)")
+        XCTAssertEqual(engine.logRevision, UInt64(UpdateEngine.maxLogLines + 10))
+    }
+
+    func testCancelDuringInstallOnlyRemovesCompletedPackage() async {
+        let mock = MockBrew()
+        mock.outdatedResult = [entry("wget"), entry("jq")]
+        let engine = makeEngine(mock)
+        _ = await engine.fetchOutdated(options: UpdateOptions())
+        mock.onInstall = { engine.cancel() }
+        await engine.runPhase1And2(entries: mock.outdatedResult, startTime: Date())
+        XCTAssertEqual(mock.installedNames, ["wget"])
+        XCTAssertEqual(engine.phase, .canceled)
+        XCTAssertEqual(engine.pendingUpdates.map(\.name), ["jq"])
+    }
+
 }

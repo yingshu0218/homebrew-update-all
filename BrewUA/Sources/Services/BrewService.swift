@@ -5,7 +5,7 @@ import Foundation
 @MainActor
 protocol BrewServicing: AnyObject {
     func update(onLine: @escaping (String) -> Void) async throws
-    func outdatedAll(greedy: Bool) async -> [OutdatedEntry]
+    func outdatedAll(greedy: Bool) async throws -> [OutdatedEntry]
     func fetch(package: OutdatedEntry, onLine: @escaping (String) -> Void, onProgress: @escaping (Int64, Int64, Double) -> Void) async throws
     func install(package: OutdatedEntry, onLine: @escaping (String) -> Void) async throws
     func caskAutoUpdates(names: [String]) async -> [String: Bool]
@@ -20,13 +20,32 @@ final class BrewService: BrewServicing {
     static let shared = BrewService()
     private let config = ConfigService.shared
 
-    init() {}
+    private let query: (([String]) async throws -> String)?
+
+    init(query: (([String]) async throws -> String)? = nil) {
+        self.query = query
+    }
+
+    enum QueryError: Error, LocalizedError {
+        case commandFailed(String)
+        case invalidJSON
+
+        var errorDescription: String? {
+            switch self {
+            case .commandFailed(let output): return "Homebrew 命令失败: \(output.suffix(1000))"
+            case .invalidJSON: return "无法解析 Homebrew 返回的数据"
+            }
+        }
+    }
 
     /// 串行执行一个 brew 同步命令,返回 stdout 字符串。
     /// 走全局 BrewGate 异步排队(替代旧 NSLock 自旋:跨 await 解锁属未定义行为且忙等)。
     private func runSerialized(_ arguments: [String]) async throws -> String {
-        try await withBrewGate {
-            try await StreamedProcess(brewArguments: arguments).runSync()
+        if let query { return try await query(arguments) }
+        return try await withBrewGate {
+            let result = await StreamedProcess(brewArguments: arguments).runSyncChecked(timeout: 30)
+            guard result.success else { throw QueryError.commandFailed(result.output) }
+            return result.output
         }
     }
 
@@ -34,7 +53,9 @@ final class BrewService: BrewServicing {
     /// 供 EnvDetector 等绕开 BrewService 内部方法的调用方统一走闸门。
     func brewOutput(_ arguments: [String], timeout: TimeInterval = 30) async -> String? {
         try? await withBrewGate {
-            try await StreamedProcess(brewArguments: arguments).runSync(timeout: timeout)
+            let result = await StreamedProcess(brewArguments: arguments).runSyncChecked(timeout: timeout)
+            guard result.success else { throw QueryError.commandFailed(result.output) }
+            return result.output
         }
     }
 
@@ -64,26 +85,26 @@ final class BrewService: BrewServicing {
     // MARK: - outdated
 
     /// 获取待更新的 formula 列表(outdated --formula --json)
-    func outdatedFormulae() async -> [OutdatedEntry] {
+    func outdatedFormulae() async throws -> [OutdatedEntry] {
         let args = ["outdated", "--formula", "--json"]
-        guard let out = try? await runSerialized(args) else { return [] }
-        return Self.parseOutdatedJSON(out, kind: .formula)
+        let out = try await runSerialized(args)
+        return try Self.parseOutdatedChecked(out, kind: .formula)
     }
 
     /// 获取待更新的 cask 列表(含 --greedy 扫描自更新应用)
-    func outdatedCasks(greedy: Bool = true) async -> [OutdatedEntry] {
+    func outdatedCasks(greedy: Bool = true) async throws -> [OutdatedEntry] {
         var args = ["outdated", "--cask"]
         if greedy { args.append("--greedy") }
         args.append("--json")
-        guard let out = try? await runSerialized(args) else { return [] }
-        return Self.parseOutdatedJSON(out, kind: .cask)
+        let out = try await runSerialized(args)
+        return try Self.parseOutdatedChecked(out, kind: .cask)
     }
 
     /// 合并后的待更新列表(已过滤屏蔽列表)
-    func outdatedAll(greedy: Bool = true) async -> [OutdatedEntry] {
+    func outdatedAll(greedy: Bool = true) async throws -> [OutdatedEntry] {
         // 注意:必须串行执行两个 brew 命令(并发会互相等锁)
-        let formulae = await outdatedFormulae()
-        let casks = await outdatedCasks(greedy: greedy)
+        let formulae = try await outdatedFormulae()
+        let casks = try await outdatedCasks(greedy: greedy)
         let ignored = config.loadIgnored()
         return (formulae + casks)
             .map { entry in
@@ -96,6 +117,10 @@ final class BrewService: BrewServicing {
 
     /// 解析 outdated --json 输出(`{"formulae":[...],"casks":[...]}` snake_case 字段)
     nonisolated static func parseOutdatedJSON(_ json: String, kind: PackageKind) -> [OutdatedEntry] {
+        (try? parseOutdatedChecked(json, kind: kind)) ?? []
+    }
+
+    nonisolated static func parseOutdatedChecked(_ json: String, kind: PackageKind) throws -> [OutdatedEntry] {
         struct OutdatedPayload: Decodable {
             struct Item: Decodable {
                 let name: String
@@ -120,11 +145,12 @@ final class BrewService: BrewServicing {
                 }
             }
         }
-        return Self.decodeJSONWithFallback(json) { text in
+        guard let entries: [OutdatedEntry] = Self.decodeJSONWithFallback(json, { text in
             guard let data = text.data(using: .utf8),
                   let payload = try? JSONDecoder().decode(OutdatedPayload.self, from: data) else { return nil }
             return payload.rawItems(kind: kind)
-        } ?? []
+        }) else { throw QueryError.invalidJSON }
+        return entries
     }
 
     // MARK: - fetch / install
@@ -294,12 +320,12 @@ final class BrewService: BrewServicing {
         let caskArgs = ["list", "--cask", "--versions", "--json"]
         let formulaOut = try? await runSerialized(formulaArgs)
         let caskOut = try? await runSerialized(caskArgs)
-        // 命令失败返回 nil;若两个都失败,判定读取失败
-        if formulaOut == nil && caskOut == nil {
+        // 任一类别读取失败都保留旧列表，避免把部分结果当作完整数据
+        if formulaOut == nil || caskOut == nil {
             return ([], false)
         }
-        let f = Self.parseInstalledList(formulaOut ?? "", kind: .formula)
-        let c = Self.parseInstalledList(caskOut ?? "", kind: .cask)
+        guard let f = try? Self.parseInstalledChecked(formulaOut ?? "", kind: .formula),
+              let c = try? Self.parseInstalledChecked(caskOut ?? "", kind: .cask) else { return ([], false) }
         return (f + c, true)
     }
 
@@ -308,21 +334,22 @@ final class BrewService: BrewServicing {
     }
 
     /// 总览页聚合统计:已安装 formula/cask 数 + 待更新 formula/cask 数(串行避免 brew 互锁)。
-    func overviewStats() async -> (installedFormulae: Int, installedCasks: Int, outdatedFormulae: Int, outdatedCasks: Int, outdatedReliable: Bool) {
-        let packages = await installedAll()
+    func overviewStats() async -> (installedFormulae: Int, installedCasks: Int, outdatedFormulae: Int, outdatedCasks: Int, outdatedReliable: Bool, installedReliable: Bool) {
+        let installed = await installedAllWithStatus()
+        let packages = installed.packages
         let ignored = config.loadIgnored()
         // outdated 检测失败(如 busy/命令异常)必须让上层知道,否则"检测失败"会被当成"没有更新"
         var outdatedReliable = true
         let outdatedF: [OutdatedEntry]
-        if let out = try? await runSerialized(["outdated", "--formula", "--json"]) {
-            outdatedF = Self.parseOutdatedJSON(out, kind: .formula)
+        if let entries = try? await outdatedFormulae() {
+            outdatedF = entries
         } else {
             outdatedF = []
             outdatedReliable = false
         }
         let outdatedC: [OutdatedEntry]
-        if let out = try? await runSerialized(["outdated", "--cask", "--json"]) {
-            outdatedC = Self.parseOutdatedJSON(out, kind: .cask)
+        if let entries = try? await outdatedCasks(greedy: false) {
+            outdatedC = entries
         } else {
             outdatedC = []
             outdatedReliable = false
@@ -331,7 +358,7 @@ final class BrewService: BrewServicing {
         let casks = packages.filter { $0.kind == .cask }.count
         let outdatedFormulae = outdatedF.filter { !ignored.contains($0.name) }.count
         let outdatedCasks = outdatedC.filter { !ignored.contains($0.name) }.count
-        return (formulae, casks, outdatedFormulae, outdatedCasks, outdatedReliable)
+        return (formulae, casks, outdatedFormulae, outdatedCasks, outdatedReliable, installed.success)
     }
 
     /// 解析 `brew list --json` 输出。
@@ -339,13 +366,17 @@ final class BrewService: BrewServicing {
     /// - cask: `{"formulae":[],"casks":[{"token","versions":[...],"pinned_version"}]}`
     /// - 与 parseOutdatedJSON 相同策略:先整段,失败再逐行从末尾找(兼容前导警告行)
     nonisolated static func parseInstalledList(_ json: String, kind: PackageKind) -> [InstalledPackage] {
+        (try? parseInstalledChecked(json, kind: kind)) ?? []
+    }
+
+    nonisolated static func parseInstalledChecked(_ json: String, kind: PackageKind) throws -> [InstalledPackage] {
         struct Payload: Decodable {
             struct FormulaItem: Decodable { let name: String; let versions: [String]; let pinned_version: String? }
             struct CaskItem: Decodable { let token: String; let versions: [String]; let pinned_version: String? }
             let formulae: [FormulaItem]
             let casks: [CaskItem]
         }
-        return Self.decodeJSONWithFallback(json) { text in
+        guard let entries: [InstalledPackage] = Self.decodeJSONWithFallback(json, { text in
             guard let data = text.data(using: .utf8),
                   let payload = try? JSONDecoder().decode(Payload.self, from: data) else { return nil }
             switch kind {
@@ -358,7 +389,8 @@ final class BrewService: BrewServicing {
                     InstalledPackage(name: $0.token, version: $0.versions.first ?? "", kind: .cask, isPinned: $0.pinned_version != nil)
                 }
             }
-        } ?? []
+        }) else { throw QueryError.invalidJSON }
+        return entries
     }
 
     /// 通用 JSON 解析 + 兜底:先整段;失败则从末尾向上逐行累积(处理前导警告/banner 后跟
