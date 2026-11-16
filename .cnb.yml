@@ -27,6 +27,10 @@ main:
           script: zsh -n brew-ua
         - name: 冒烟测试（stub brew，无网络依赖）
           script: zsh scripts/test.sh
+        - name: CLI 边界回归（假 brew、临时 HOME/TMPDIR）
+          script: python3 scripts/test-cli-edge.py
+        - name: CLI 并发锁回归
+          script: python3 scripts/test-cli-lock.py
 
   # ↓↓↓ 启用实时同步时,取消本段注释(同时建好 keys 密钥仓库) ↓↓↓
   # - name: 同步到 GitHub

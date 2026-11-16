@@ -4,9 +4,19 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Version tag to apply to Formula
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+concurrency:
+  group: bump-formula
+  cancel-in-progress: false
 
 jobs:
   bump:
@@ -14,14 +24,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
       - name: Bump formula url and sha256
+        env:
+          TAG_INPUT: ${{ inputs.tag_name }}
+          RELEASE_TAG_SELECTOR: ${{ github.workspace }}/scripts/release-tags.py
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="${TAG_INPUT}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          python3 "$RELEASE_TAG_SELECTOR" compare "$TAG" "$TAG" >/dev/null
           REPO="${GITHUB_REPOSITORY}"
           FORMULA="Formula/brew-update-all.rb"
+
+          git fetch --no-tags origin main
+          git checkout -B formula-bump origin/main
+          git fetch --no-tags origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          TAG_SHA=$(git rev-parse "refs/tags/${TAG}^{commit}")
+          echo "formula base: $(git rev-parse HEAD), tag ${TAG}: ${TAG_SHA}"
+
+          CURRENT_TAG=$(ruby -e '
+            formula = File.read(ARGV.fetch(0))
+            match = formula.match(/^  url "[^\"]*\/tags\/(v[^\"]+)\.tar\.gz"$/)
+            puts(match ? match[1] : "")
+          ' "$FORMULA")
+          if [[ -n "$CURRENT_TAG" ]]; then
+            python3 "$RELEASE_TAG_SELECTOR" require-not-older "$TAG" "$CURRENT_TAG"
+          fi
 
           # 从 GitHub 下载 tag tarball 并计算 sha256（动态生成，勿用本地 archive）
           # 加重试：GitHub codeload 偶发 502/连接抖动
@@ -30,7 +64,7 @@ jobs:
           echo "tag=${TAG} sha256=${SHA}"
 
           # 幂等：Formula 已指向该版本则跳过
-          if grep -q "${TAG}.tar.gz" "$FORMULA" && grep -q "${SHA}" "$FORMULA"; then
+          if grep -Fq "${TAG}.tar.gz" "$FORMULA" && grep -Fq "${SHA}" "$FORMULA"; then
             echo "Formula 已是最新，无需更新"
             exit 0
           fi
@@ -47,5 +81,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "$FORMULA"
-          git commit -m "Bump version to ${TAG}" || echo "无改动"
+          if git diff --cached --quiet; then
+            echo "Formula 已是最新，无需更新"
+            exit 0
+          fi
+          git commit -m "Bump version to ${TAG}"
+          # Rebase on the latest main in case another independent main update
+          # landed while the tarball checksum was being computed. The push stays
+          # fast-forward only; a Formula conflict fails visibly for review.
+          git fetch --no-tags origin main
+          git rebase origin/main
           git push origin HEAD:main

@@ -6,6 +6,14 @@ enum PackageKind: String, Codable {
     case cask
 }
 
+/// Homebrew 名称在 formula 与 cask 命名空间中可以重复，业务层一律使用此组合身份。
+struct PackageIdentity: Hashable, CustomStringConvertible {
+    let kind: PackageKind
+    let name: String
+
+    var description: String { "\(kind.rawValue)/\(name)" }
+}
+
 /// 一个已安装的包(包管理页数据)
 /// id 用 kind+name 稳定组合键(非 UUID):每次刷新列表时 SwiftUI 能 diff 复用行视图,避免整表重建闪烁
 struct InstalledPackage: Identifiable, Hashable {
@@ -14,7 +22,8 @@ struct InstalledPackage: Identifiable, Hashable {
     let kind: PackageKind
     var isPinned: Bool = false
 
-    var id: String { kind.rawValue + "/" + name }
+    var identity: PackageIdentity { PackageIdentity(kind: kind, name: name) }
+    var id: String { identity.description }
 }
 
 /// 一个 brew services 服务(服务管理页)
@@ -41,7 +50,8 @@ struct OutdatedEntry: Identifiable, Hashable {
     /// 是否自更新应用(cask 的 auto_updates 字段;formula/未知时 nil)
     var autoUpdates: Bool?
 
-    var id: String { kind.rawValue + "/" + name }
+    var identity: PackageIdentity { PackageIdentity(kind: kind, name: name) }
+    var id: String { identity.description }
 
     var displayVersion: String {
         "\(currentVersion) → \(newestVersion)"
@@ -79,7 +89,8 @@ struct PackageTask: Identifiable {
     var startedAt: Date?
     var finishedAt: Date?
 
-    var id: String { kind.rawValue + "/" + name }
+    var identity: PackageIdentity { PackageIdentity(kind: kind, name: name) }
+    var id: String { identity.description }
 
     var durationText: String {
         guard let s = startedAt else { return "—" }

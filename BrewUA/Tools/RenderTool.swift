@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 
 // 离线渲染器:在无屏幕权限的环境里把关键视图渲染成 PNG,供人工检查布局
-// 用法: swift RenderTool.swift /tmp/output_dir
+// 编译检查: BrewUA/scripts/verify-gui.sh render
 
 @main
 struct RenderTool {
@@ -37,7 +37,7 @@ struct RenderTool {
         let task4 = PackageTask(name: "redis", kind: .formula, status: .queued)
         engine.injectPreview(
             tasks: [task1, task2, task3, task4],
-            summary: RunSummary(total: 4, succeeded: 1, failed: 1, timeout: 1, skipped: 0,
+            summary: RunSummary(total: 4, succeeded: 1, failed: 1, timeout: 1,
                                 totalDuration: 125, failedNames: ["mysql", "nginx"]),
             phase: .finished,
             logs: ["① 更新 Homebrew 源…", "  ==> Updating Homebrew", "② 检查待更新包…",
@@ -69,7 +69,7 @@ struct RenderTool {
             hosting.layoutSubtreeIfNeeded()
             hosting.displayIfNeeded()
             // 跑 runloop 让 SwiftUI 完成布局与字体加载
-            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+            pumpRunLoop(for: 0.5)
             hosting.layoutSubtreeIfNeeded()
             hosting.displayIfNeeded()
 
@@ -86,5 +86,10 @@ struct RenderTool {
         }
         print("DONE")
         exit(0)
+    }
+
+    @MainActor
+    private static func pumpRunLoop(for duration: TimeInterval) {
+        RunLoop.current.run(until: Date().addingTimeInterval(duration))
     }
 }

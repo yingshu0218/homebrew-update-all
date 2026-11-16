@@ -87,8 +87,13 @@ struct ServicesView: View {
         case .restart: args = ["services", "restart", svc.name]
         }
         do {
-            _ = try await withBrewGate {
-                try await StreamedProcess(brewArguments: args).runSync()
+            let result = try await withBrewGate {
+                await StreamedProcess(brewArguments: args).runSyncChecked(timeout: Constants.brewSyncTimeout)
+            }
+            guard result.success else {
+                if result.timedOut { throw ProcessError.timedOut(seconds: Constants.brewSyncTimeout) }
+                if result.cancelled { throw CancellationError() }
+                throw ProcessError.terminated(code: result.exitCode ?? -1)
             }
             lastAction = "已\(action.title) \(svc.name)"
         } catch {

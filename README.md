@@ -52,6 +52,10 @@ brew ua ck
 brew ua ig firefox
 brew ua uig firefox
 brew ua igl
+
+# Ignore/un-ignore a formula (cask remains the default)
+brew ua ig --formula wget
+brew ua uig --formula wget
 ```
 
 | Mode / option | Description |
@@ -64,9 +68,13 @@ brew ua igl
 | `--prune` | Deep clean download cache after upgrading (`brew cleanup --prune=all`) |
 | `--clean-logs` | Clean this run's temp log directory |
 | `ck` / `check` | Diagnostics: network, tap sources, local config |
-| `ig` / `ignore <cask>` | Ignore a cask so it never appears in the update list |
-| `uig` / `unignore <cask>` | Un-ignore a cask |
-| `igl` / `ignored` | List ignored casks |
+| `ig` / `ignore <name>` | Ignore a cask (default) so it never appears in the update list |
+| `ig --formula <name>` | Ignore a formula |
+| `uig` / `unignore <name>` | Un-ignore a cask (default) |
+| `uig --formula <name>` | Un-ignore a formula |
+| `igl` / `ignored` | List ignored formulae and casks |
+
+Ignore rules remain in `~/.config/brew-ua/ignored_casks`: legacy bare-name lines and new cask rules apply to casks; formula rules use `formula:<name>`. A rule containing `/` matches that full tap name only. A short name matches the last path component for the same package type.
 
 > **Note**: without `-a`, Homebrew skips casks with `auto_updates true` (they update themselves). Add `-a` if you want to pin every app version.
 
@@ -77,7 +85,7 @@ brew ua igl
 - ⏱️ **Timing stats** – per-package and total duration
 - 📋 **Summary report** – success/failure counts and detail lists
 - 🎯 **Category filter** – formulae-only or casks-only
-- 🚫 **Ignore list** – skip specific casks
+- 🚫 **Ignore list** – skip specific formulae and casks
 - 🔍 **Logging** – failed packages keep logs in a private temp dir (`$TMPDIR/brew-ua.XXXXXX`)
 - 📦 **Package size** – parsed after download and shown inline
 - ⚡ **Download speed** – live MB/s for both casks and formulae
@@ -88,8 +96,8 @@ brew ua igl
 
 1. **brew update** – refresh taps and package info
 2. **List outdated packages** – formulae and casks in a bordered panel
-3. **Stage 1: download all** – fetch each package with live progress/speed, a per-package timeout (default 10 min), and failure isolation; a stuck download is killed and skipped, the rest continue
-4. **Stage 2: install all** – install only the successfully downloaded packages (casks via `brew reinstall`, formulae via `brew upgrade`)
+3. **Stage 1: download all** – fetch each package with live progress/speed, a per-package timeout (default 10 min), and failure isolation. Formula fetches include `--deps`; cask fetches use supported cask options. Cancellation and timeout stop and reap the download process group.
+4. **Stage 2: install all** – install only the successfully downloaded packages (casks via `brew reinstall`, formulae via `brew upgrade`). Cancellation waits for the current install to finish before stopping the queue. Formula source builds and cask installers can still need network access during installation.
 5. **brew cleanup** – remove old versions
 6. **Summary** – total time, success rate, success/failure lists
 
@@ -133,8 +141,9 @@ brew untap yingshu0218/update-all
 
 ## CI
 
-- **CNB** (`.cnb.yml`) — zsh syntax check + smoke tests on every push (Linux container, fast feedback during development)
-- **GitHub Actions** — macOS runner: smoke tests, Formula structure check, `brew audit`; plus a scheduled job syncing all branches from the CNB development repo every 6 hours
+- **CNB** (`.cnb.yml`) — zsh syntax check, smoke tests, CLI boundary regressions, and lock checks on every push (tests use fake brew and no network)
+- **GitHub Actions** — CLI tests and Formula checks, plus a macOS app build/XCTest workflow
+- **CNB sync** — GitHub checks the CNB development repo daily at 09:17 China time. After a successful sync it explicitly dispatches CLI and macOS validation for the actual GitHub `main` SHA, then dispatches one Formula update for the highest valid newly synced `v*` tag. Formula updates start from current `main` and reject downgrades. These runs do not depend on recursive `push` events from `GITHUB_TOKEN`.
 
 ## License
 

@@ -43,16 +43,17 @@ final class UpdateEngine: ObservableObject {
     private var cancelFlag = false
     private var runningTask: Task<Void, Never>?
     private let services: BrewServicing
-    private let config = ConfigService.shared
+    private let config: ConfigService
     private let history: HistoryService
-    /// 包名 → 版本映射(构建历史记录用;upgrade/fetchOutdated 时填充,retryFailed 保留旧值)
-    private var versionMap: [String: (from: String, to: String)] = [:]
+    /// 类型 + 包名 → 版本映射，避免同名 formula/cask 覆盖彼此的版本历史。
+    private var versionMap: [PackageIdentity: (from: String, to: String)] = [:]
     /// 单包下载超时(秒),与 brew-ua 默认 600 一致
     var fetchTimeout: TimeInterval = Constants.fetchTimeout
 
-    init(services: BrewServicing? = nil, history: HistoryService? = nil) {
+    init(services: BrewServicing? = nil, history: HistoryService? = nil, config: ConfigService = .shared) {
         self.services = services ?? BrewService.shared
         self.history = history ?? HistoryService.shared
+        self.config = config
     }
 
     /// 供 UI 渲染工具/预览注入假数据视图状态(生产代码不调用)。
@@ -83,12 +84,12 @@ final class UpdateEngine: ObservableObject {
 
     /// 运行前公共复位。返回 false 表示已有任务在跑(调用方直接 return)。
     @discardableResult
-    private func beginRun() -> Bool {
+    private func beginRun(preservingVersions: Bool = false) -> Bool {
         guard !isRunning else { return false }
         cancelFlag = false
         isRunning = true
         summary = nil
-        versionMap = [:]
+        if !preservingVersions { versionMap = [:] }
         return true
     }
 
@@ -104,12 +105,15 @@ final class UpdateEngine: ObservableObject {
 
     /// 升级指定的包(两阶段:下载→安装)。
     func upgrade(packages: [OutdatedEntry], options: UpdateOptions = UpdateOptions()) {
-        guard !packages.isEmpty, beginRun() else { return }
-        packages.forEach { versionMap[$0.name] = ($0.currentVersion, $0.newestVersion) }
-        tasks = packages.map { PackageTask(name: $0.name, kind: $0.kind, status: .queued) }
+        let ignoredRules = config.loadIgnored()
+        pendingUpdates = filterOutIgnored(pendingUpdates, ignored: ignoredRules)
+        let eligible = filterOutIgnored(packages, ignored: ignoredRules)
+        guard !eligible.isEmpty, beginRun() else { return }
+        eligible.forEach { versionMap[$0.identity] = ($0.currentVersion, $0.newestVersion) }
+        tasks = eligible.map { PackageTask(name: $0.name, kind: $0.kind, status: .queued) }
         let startTime = Date()
         runningTask = Task { [weak self] in
-            await self?.runPhase1And2(entries: packages, startTime: startTime)
+            await self?.runPhase1And2(entries: eligible, startTime: startTime)
         }
     }
 
@@ -126,6 +130,11 @@ final class UpdateEngine: ObservableObject {
 
     func cancel() {
         cancelFlag = true
+        // 更新源和检查清单需要中断当前子进程；下载监听软标志。
+        // 安装阶段不取消 runningTask，当前包安全完成后不再启动下一个包。
+        if phase == .updatingTaps || phase == .fetchingOutdated {
+            runningTask?.cancel()
+        }
         // 软标志 + 下载级联取消:downloadWithTimeout 内会监听 cancelFlag 主动取消下载 Task
         // → StreamedProcess.onTermination kill(-pid) 整组终止当前 brew 进程(下载立即停)。
         // 注意不能直接 runningTask?.cancel():那会连安装中的包(services.install 的 stream)
@@ -146,8 +155,9 @@ final class UpdateEngine: ObservableObject {
     /// 升级后仅移除成功的包；取消和失败的包仍可继续升级。
     /// 保持 pendingUpdates 反映"此刻还剩哪些可更新"。
     private func prunePendingAfterRun() {
-        let done = Set(tasks.filter { $0.status == .succeeded }.map(\.name))
-        pendingUpdates = pendingUpdates.filter { !done.contains($0.name) }
+        let done = Set(tasks.filter { $0.status == .succeeded }.map(\.identity))
+        pendingUpdates = filterOutIgnored(pendingUpdates, ignored: config.loadIgnored())
+            .filter { !done.contains($0.identity) }
     }
 
     /// 清空日志与摘要
@@ -165,10 +175,10 @@ final class UpdateEngine: ObservableObject {
             if case .failed = $0.status { return true }
             return $0.status == .timeout || $0.status == .canceled
         }
-        guard !failed.isEmpty, beginRun() else { return }
+        guard !failed.isEmpty, beginRun(preservingVersions: true) else { return }
         // 重置这些任务为 queued,其余移除
-        let failedNames = Set(failed.map(\.name))
-        tasks = tasks.filter { failedNames.contains($0.name) }.map {
+        let failedIDs = Set(failed.map(\.identity))
+        tasks = tasks.filter { failedIDs.contains($0.identity) }.map {
             var t = $0
             t.status = .queued
             t.bytesDownloaded = 0
@@ -178,7 +188,14 @@ final class UpdateEngine: ObservableObject {
             t.finishedAt = nil
             return t
         }
-        let entries = failed.map { OutdatedEntry(name: $0.name, currentVersion: "?", newestVersion: "?", kind: $0.kind, isIgnored: false) }
+        let entries = failed.map { task -> OutdatedEntry in
+            let version = versionMap[task.identity]
+            return OutdatedEntry(name: task.name,
+                                 currentVersion: version?.from ?? "?",
+                                 newestVersion: version?.to ?? "?",
+                                 kind: task.kind,
+                                 isIgnored: false)
+        }
         let startTime = Date()
         runningTask = Task { [weak self] in
             guard let self else { return }
@@ -206,6 +223,7 @@ final class UpdateEngine: ObservableObject {
             finish(.failed("更新源失败:\(error.localizedDescription)"), summary: nil)
             return nil
         }
+        guard !cancelFlag else { return nil }
 
         // ② 列出待更新
         phase = .fetchingOutdated
@@ -220,8 +238,8 @@ final class UpdateEngine: ObservableObject {
         }
         guard !cancelFlag else { return nil }
 
-        let ignoredNames = config.loadIgnored()
-        var entries = filterOutIgnored(outdated, ignored: ignoredNames)
+        let ignoredRules = config.loadIgnored()
+        var entries = filterOutIgnored(outdated, ignored: ignoredRules)
         // ③ 补充 cask 的 auto_updates 标识(一次批量查询,升级中心据此显示"自更新"徽标)
         let caskNames = entries.filter { $0.kind == .cask }.map(\.name)
         if !caskNames.isEmpty {
@@ -235,7 +253,7 @@ final class UpdateEngine: ObservableObject {
                 }
             }
         }
-        entries.forEach { versionMap[$0.name] = ($0.currentVersion, $0.newestVersion) }
+        entries.forEach { versionMap[$0.identity] = ($0.currentVersion, $0.newestVersion) }
         pendingUpdates = entries
         return entries
     }
@@ -291,18 +309,28 @@ final class UpdateEngine: ObservableObject {
     /// 任务列表在本方法初始化(retryFailed 预置重试清单时 tasks 非空,不覆盖)。
     func runPhase1And2(entries: [OutdatedEntry], startTime: Date) async {
         defer { prunePendingAfterRun() }
+        let entries = filterOutIgnored(entries, ignored: config.loadIgnored())
+        let entryIDs = Set(entries.map(\.identity))
         if tasks.isEmpty {
             tasks = entries.map { PackageTask(name: $0.name, kind: $0.kind, status: .queued) }
+        } else {
+            tasks = tasks.filter { entryIDs.contains($0.identity) }
+        }
+        guard !entries.isEmpty else {
+            finish(.finished, summary: nil)
+            return
         }
         // ③ 阶段1:逐包下载
         phase = .phase1Download
         appendLog("③ 阶段1:逐个下载…")
         for (idx, entry) in entries.enumerated() {
             if cancelFlag { break }
-            guard let taskIdx = tasks.firstIndex(where: { $0.name == entry.name }) else { continue }
+            // 配置可能在检查清单后改变，执行每个包前再读共享屏蔽文件。
+            if config.isIgnored(name: entry.name, kind: entry.kind) { continue }
+            guard let taskIdx = tasks.firstIndex(where: { $0.identity == entry.identity }) else { continue }
             tasks[taskIdx].status = .downloading
             tasks[taskIdx].startedAt = Date()
-            appendLog("下载 [\(idx + 1)/\(entries.count)] \(entry.name)…")
+            appendLog("下载 [\(idx + 1)/\(entries.count)] \(entry.identity)…")
 
             let result = await downloadWithTimeout(package: entry) { line in
                 self.appendLog("  " + line)
@@ -313,19 +341,19 @@ final class UpdateEngine: ObservableObject {
                 tasks[taskIdx].status = .downloaded
                 tasks[taskIdx].speedBytesPerSec = 0 // 停止下载,速度归零,显示"已下载待安装"
                 tasks[taskIdx].finishedAt = Date()
-                appendLog("✓ \(entry.name) 下载完成")
+                appendLog("✓ \(entry.identity) 下载完成")
             case .timeout:
                 tasks[taskIdx].status = .timeout
                 tasks[taskIdx].finishedAt = Date()
-                appendLog("✗ \(entry.name) 下载超时(\(Int(fetchTimeout))s),已隔离")
+                appendLog("✗ \(entry.identity) 下载超时(\(Int(fetchTimeout))s),已隔离")
             case .failed(let reason):
                 tasks[taskIdx].status = .failed(reason)
                 tasks[taskIdx].finishedAt = Date()
-                appendLog("✗ \(entry.name) 下载失败:\(reason),已隔离")
+                appendLog("✗ \(entry.identity) 下载失败:\(reason),已隔离")
             case .canceled:
                 tasks[taskIdx].status = .canceled
                 tasks[taskIdx].finishedAt = Date()
-                appendLog("已取消 \(entry.name) 下载")
+                appendLog("已取消 \(entry.identity) 下载")
             }
         }
 
@@ -341,23 +369,33 @@ final class UpdateEngine: ObservableObject {
             // 取消后不再启动新包安装;正在安装的包让其安全装完
             if cancelFlag { break }
             guard let taskIdx = tasks.firstIndex(where: { $0.id == task.id }) else { continue }
+            if config.isIgnored(name: task.name, kind: task.kind) {
+                tasks[taskIdx].status = .queued
+                appendLog("已屏蔽，跳过安装：\(task.identity)")
+                continue
+            }
             tasks[taskIdx].status = .installing
             tasks[taskIdx].finishedAt = nil
             tasks[taskIdx].speedBytesPerSec = 0
-            appendLog("安装 [\(idx + 1)/\(toInstall.count)] \(task.name)…")
+            appendLog("安装 [\(idx + 1)/\(toInstall.count)] \(task.identity)…")
             do {
-                let entry = OutdatedEntry(name: task.name, currentVersion: "?", newestVersion: "?", kind: task.kind, isIgnored: false)
+                let version = versionMap[task.identity]
+                let entry = OutdatedEntry(name: task.name,
+                                          currentVersion: version?.from ?? "?",
+                                          newestVersion: version?.to ?? "?",
+                                          kind: task.kind,
+                                          isIgnored: false)
                 try await services.install(package: entry) { [weak self] line in
                     self?.appendLog("  " + line)
                 }
                 // 安装已完整执行完毕 → 无论是否取消都算成功(用户决策:安装让当前包装完)
                 tasks[taskIdx].status = .succeeded
                 tasks[taskIdx].finishedAt = Date()
-                appendLog("✓ \(task.name) 升级完成")
+                appendLog("✓ \(task.identity) 升级完成")
             } catch {
                 tasks[taskIdx].status = .failed("安装失败")
                 tasks[taskIdx].finishedAt = Date()
-                appendLog("✗ \(task.name) 安装失败:\(error.localizedDescription)")
+                appendLog("✗ \(task.identity) 安装失败:\(error.localizedDescription)")
             }
         }
 
@@ -385,7 +423,7 @@ final class UpdateEngine: ObservableObject {
                         onLine(line)
                     }, onProgress: { bytes, total, speed in
                         guard !Task.isCancelled else { return }
-                        if let idx = self.tasks.firstIndex(where: { $0.name == package.name }) {
+                        if let idx = self.tasks.firstIndex(where: { $0.identity == package.identity }) {
                             self.tasks[idx].bytesDownloaded = bytes
                             self.tasks[idx].totalBytes = total
                             self.tasks[idx].speedBytesPerSec = speed
@@ -433,7 +471,7 @@ final class UpdateEngine: ObservableObject {
     private func recordHistory() {
         guard !tasks.isEmpty else { return }
         let entries = tasks.map { task -> RecordEntry in
-            let version = versionMap[task.name]
+            let version = versionMap[task.identity]
             let detail: String
             switch task.status {
             case .failed(let reason): detail = reason
@@ -466,7 +504,7 @@ final class UpdateEngine: ObservableObject {
             timeout: timedOut,
             totalDuration: Date().timeIntervalSince(startTime),
             failedNames: tasks.compactMap { task in
-                if case .failed = task.status { return task.name }
+                if case .failed = task.status { return task.identity.description }
                 return nil
             }
         )
@@ -489,6 +527,12 @@ final class UpdateEngine: ObservableObject {
     var successCount: Int { tasks.filter { $0.status == .succeeded }.count }
     var failedCount: Int { tasks.filter { if case .failed = $0.status { return true }; return false }.count }
     var timeoutCount: Int { tasks.filter { $0.status == .timeout }.count }
+    var retryableCount: Int {
+        tasks.filter { task in
+            if case .failed = task.status { return true }
+            return task.status == .timeout || task.status == .canceled
+        }.count
+    }
     var downloadedCount: Int { tasks.filter { $0.status == .downloaded }.count }
 }
 
@@ -508,5 +552,5 @@ struct UpdateOptions {
 
 /// 待更新项过滤规则(屏蔽列表) —— 提取为纯函数以便单测。
 func filterOutIgnored(_ entries: [OutdatedEntry], ignored: Set<String>) -> [OutdatedEntry] {
-    entries.filter { !ignored.contains($0.name) }
+    entries.filter { !ConfigService.isIgnored(name: $0.name, kind: $0.kind, rules: ignored) }
 }

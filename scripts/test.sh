@@ -138,7 +138,7 @@ check "失败计入统计" "echo \"\$OUT\" | grep -q '下载失败'"
 echo "[场景 4] formula 走 --formula fetch（非 cask 分支）"
 rm -f "$WORK/home/call.log"
 run_ua "$WORK/s4.log" f
-check "fetch 使用 --formula" "grep -q 'fetch --formula fake-a' \"\$WORK/home/call.log\""
+check "formula fetch 含依赖参数 --deps" "grep -q 'fetch --formula --deps fake-a' \"\$WORK/home/call.log\""
 
 # ========== 场景 5：非 TTY 无 ANSI ==========
 echo "[场景 5] 非 TTY 输出无 ANSI 控制符"

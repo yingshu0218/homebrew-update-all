@@ -4,18 +4,29 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Commit to validate after CNB sync
+        required: true
+        type: string
 
 jobs:
   test:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
 
       - name: zsh 语法检查
         run: zsh -n brew-ua
 
       - name: 冒烟测试（stub brew，无网络）
         run: zsh scripts/test.sh
+
+      - name: CLI 边界回归（假 brew、临时 HOME/TMPDIR）
+        run: python3 scripts/test-cli-edge.py
 
       - name: CLI 并发启动与崩溃释放锁
         run: python3 scripts/test-cli-lock.py

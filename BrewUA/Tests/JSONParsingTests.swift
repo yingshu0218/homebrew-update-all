@@ -173,20 +173,56 @@ final class JSONParsingTests: XCTestCase {
 
     // MARK: - 下载 URL 提取与总大小探测
 
-    /// formula 的 info JSON 里 urls 数组优先
-    func testExtractDownloadURLFromFormula() {
+    /// Homebrew 官方 formula API 的真实结构：urls.stable.url 与 bottle.stable.files[tag].url。
+    func testExtractDownloadURLFromOfficialFormulaFixtureUsesBottle() {
         let json = """
-        {"formulae":[{"name":"wget","urls":["https://mirror.example.com/wget.tar.gz"],"url":"https://fallback.example.com/wget.tar.gz"}],"casks":[]}
+        {"formulae":[{"name":"wget","urls":{"stable":{"url":"https://ftpmirror.gnu.org/wget/wget-1.25.0.tar.gz","tag":null,"revision":null,"using":null,"checksum":"766e48423e79359ea31e41db9e5c289675947a7fcf2efdcedb726ac9d0da3784"},"head":{"url":"https://git.savannah.gnu.org/git/wget.git","branch":"master","using":null}},"bottle":{"stable":{"rebuild":0,"root_url":"https://ghcr.io/v2/homebrew/core","files":{"arm64_tahoe":{"cellar":"/opt/homebrew/Cellar","url":"https://ghcr.io/v2/homebrew/core/wget/blobs/sha256:d89ea78fbc8ec79a80d52c7dcaa28e50c2bb435acd1470ee2cae4ef7646eff7e","sha256":"d89ea78fbc8ec79a80d52c7dcaa28e50c2bb435acd1470ee2cae4ef7646eff7e"},"arm64_sequoia":{"cellar":"/opt/homebrew/Cellar","url":"https://ghcr.io/v2/homebrew/core/wget/blobs/sha256:899cfc98a094aa22f54d7b46762f2e9529dfa621bc2103d2612747ad251c633c","sha256":"899cfc98a094aa22f54d7b46762f2e9529dfa621bc2103d2612747ad251c633c"}}}}}],"casks":[]}
         """
-        XCTAssertEqual(BrewService.extractDownloadURL(fromInfoJSON: json), "https://mirror.example.com/wget.tar.gz")
+        XCTAssertEqual(
+            BrewService.extractDownloadURL(fromInfoJSON: json, platform: "arm64_tahoe"),
+            "https://ghcr.io/v2/homebrew/core/wget/blobs/sha256:d89ea78fbc8ec79a80d52c7dcaa28e50c2bb435acd1470ee2cae4ef7646eff7e"
+        )
     }
 
-    /// formula 无 urls 数组时回退 url 字段
-    func testExtractDownloadURLFromFormulaFallback() {
+    /// `brew --cache` 给出的 bottle tag 能识别 Homebrew 为新系统选择的旧版兼容 bottle。
+    func testExtractDownloadURLUsesCacheSelectedCompatibleBottle() {
         let json = """
-        {"formulae":[{"name":"wget","url":"https://fallback.example.com/wget.tar.gz"}],"casks":[]}
+        {"formulae":[{"name":"fixture","urls":{"stable":{"url":"https://source.example/fixture-1.0.tar.gz"}},"bottle":{"stable":{"files":{"arm64_tahoe":{"url":"https://bottle.example/tahoe.tar.gz"},"arm64_sonoma":{"url":"https://bottle.example/sonoma.tar.gz"}}}}}],"casks":[]}
         """
-        XCTAssertEqual(BrewService.extractDownloadURL(fromInfoJSON: json), "https://fallback.example.com/wget.tar.gz")
+        let selectedCache = URL(fileURLWithPath: "/tmp/brew-cache/fixture-1.0.arm64_sonoma.bottle.tar.gz")
+        XCTAssertEqual(BrewService.extractDownloadURL(fromInfoJSON: json, platform: "arm64_tahoe", cacheFileURL: selectedCache),
+                       "https://bottle.example/sonoma.tar.gz")
+    }
+
+    /// Intel macOS bottle key 是 `sequoia`，不带 `x86_64_` 前缀。
+    func testExtractDownloadURLUsesIntelBottleTag() {
+        let json = """
+        {"formulae":[{"name":"fixture","urls":{"stable":{"url":"https://source.example/fixture-1.0.tar.gz"}},"bottle":{"stable":{"files":{"sequoia":{"url":"https://bottle.example/intel-sequoia.tar.gz"},"sonoma":{"url":"https://bottle.example/intel-sonoma.tar.gz"}}}}}],"casks":[]}
+        """
+        let selectedCache = URL(fileURLWithPath: "/tmp/brew-cache/fixture-1.0.sequoia.bottle.tar.gz")
+        XCTAssertEqual(BrewService.extractDownloadURL(fromInfoJSON: json, platform: "sequoia", cacheFileURL: selectedCache),
+                       "https://bottle.example/intel-sequoia.tar.gz")
+    }
+
+    func testBottlePlatformUsesHomebrewIntelMacOSKeys() {
+        XCTAssertEqual(BrewService.bottlePlatform(architecture: "x86_64", macOSMajorVersion: 15), "sequoia")
+        XCTAssertEqual(BrewService.bottlePlatform(architecture: "arm64", macOSMajorVersion: 15), "arm64_sequoia")
+    }
+
+    func testUnknownSelectedBottleDoesNotUseSourceSizeAsBottleSize() {
+        let json = """
+        {"formulae":[{"name":"fixture","urls":{"stable":{"url":"https://source.example/fixture-1.0.tar.gz"}},"bottle":{"stable":{"files":{"arm64_tahoe":{"url":"https://bottle.example/tahoe.tar.gz"}}}}}],"casks":[]}
+        """
+        let selectedCache = URL(fileURLWithPath: "/tmp/brew-cache/fixture-1.0.unknown.bottle.tar.gz")
+        XCTAssertNil(BrewService.extractDownloadURL(fromInfoJSON: json, platform: "arm64_tahoe", cacheFileURL: selectedCache))
+    }
+
+    func testExtractDownloadURLFallsBackToStableSourceWhenNoBottleExists() {
+        let json = """
+        {"formulae":[{"name":"fixture","urls":{"stable":{"url":"https://source.example/fixture-1.0.tar.gz"}},"bottle":{"stable":{"files":{}}}}],"casks":[]}
+        """
+        XCTAssertEqual(BrewService.extractDownloadURL(fromInfoJSON: json, platform: "arm64_tahoe"),
+                       "https://source.example/fixture-1.0.tar.gz")
     }
 
     /// cask 的 info JSON 用 url 字段
@@ -197,12 +233,12 @@ final class JSONParsingTests: XCTestCase {
         XCTAssertEqual(BrewService.extractDownloadURL(fromInfoJSON: json), "https://github.com/bambulab/BambuStudio/releases/download/v1/b.dmg")
     }
 
-    /// cask 无顶层 url 时回退 artifacts 里的 url
-    func testExtractDownloadURLFromCaskArtifactsFallback() {
+    /// cask 下载源只取 cask 的实际顶层 url，不把任意 artifact URL 当作包体。
+    func testExtractDownloadURLDoesNotGuessCaskArtifactURL() {
         let json = """
         {"formulae":[],"casks":[{"token":"some-app","url":null,"artifacts":[{"url":"https://a.example.com/some.dmg"}]}]}
         """
-        XCTAssertEqual(BrewService.extractDownloadURL(fromInfoJSON: json), "https://a.example.com/some.dmg")
+        XCTAssertNil(BrewService.extractDownloadURL(fromInfoJSON: json))
     }
 
     /// 无任何 URL 信息返回 nil

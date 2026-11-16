@@ -14,6 +14,9 @@ enum Constants {
     /// 轻量 brew 命令(info/list/outdated/config)同步超时(秒)
     static let brewSyncTimeout: TimeInterval = 30
 
+    /// 更新 Homebrew 源可能需要多分钟，但不允许无限等待。
+    static let brewUpdateTimeout: TimeInterval = 600
+
     /// HEAD 探测包大小的网络超时(秒)
     static let headProbeTimeout: TimeInterval = 15
 

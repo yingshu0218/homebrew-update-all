@@ -10,6 +10,7 @@ struct SettingsView: View {
     @State private var isDetected = false
     @State private var ignored: [String] = []
     @State private var newIgnoreName = ""
+    @State private var newIgnoreKind: PackageKind = .cask
     @State private var isExporting = false
     @State private var brewfileText = ""
     @State private var exportMessage: String?
@@ -55,9 +56,14 @@ struct SettingsView: View {
 
             if let info = envInfo {
                 HStack(spacing: 16) {
-                    Label(info.mirrorSource.displayName, systemImage: "checkmark.seal")
-                        .font(.body.weight(.medium))
-                        .foregroundStyle(info.mirrorSource.tint)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Label("本次 brew 环境：\(info.mirrorSource.displayName)", systemImage: "checkmark.seal")
+                            .font(.body.weight(.medium))
+                            .foregroundStyle(info.mirrorSource.tint)
+                        Text("Shell 配置（仅检测）：\(info.shellConfiguredMirrorSource.displayName)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     Text(info.isNetworkOk ? "网络可达(\(info.networkCountry))" : "网络不可达")
                         .font(.caption)
                         .foregroundStyle(info.isNetworkOk ? Color.green : Color.red)
@@ -105,9 +111,14 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 8) {
-                TextField("输入包名(如 some-app)", text: $newIgnoreName)
+                TextField("包名(如 some-app 或 owner/tap/name)", text: $newIgnoreName)
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 260)
+                Picker("类型", selection: $newIgnoreKind) {
+                    Text("Cask").tag(PackageKind.cask)
+                    Text("Formula").tag(PackageKind.formula)
+                }
+                .frame(width: 130)
                 Button {
                     addIgnored()
                 } label: {
@@ -125,7 +136,7 @@ struct SettingsView: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 8)], spacing: 8) {
                     ForEach(ignored, id: \.self) { name in
                         HStack(spacing: 6) {
-                            Text(name)
+                            Text(IgnoredPackageRule(storageValue: name).displayValue)
                                 .font(.caption.monospaced())
                                 .lineLimit(1)
                             Spacer()
@@ -136,7 +147,7 @@ struct SettingsView: View {
                                     .foregroundStyle(.secondary)
                             }
                             .buttonStyle(.plain)
-                            .help("解除屏蔽 \(name)")
+                            .help("解除屏蔽 \(IgnoredPackageRule(storageValue: name).displayValue)")
                         }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
@@ -150,13 +161,13 @@ struct SettingsView: View {
     private func addIgnored() {
         let name = newIgnoreName.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty else { return }
-        try? config.addIgnored(name)
+        try? config.addIgnored(name, kind: newIgnoreKind)
         newIgnoreName = ""
         ignored = config.loadIgnored().sorted()
     }
 
     private func removeIgnored(_ name: String) {
-        try? config.removeIgnored(name)
+        try? config.removeIgnoredRaw(name)
         ignored = config.loadIgnored().sorted()
     }
 

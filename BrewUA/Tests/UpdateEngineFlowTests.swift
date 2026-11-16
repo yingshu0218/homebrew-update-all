@@ -12,33 +12,43 @@ final class UpdateEngineFlowTests: XCTestCase {
         var outdatedError: Error?
         var outdatedResult: [OutdatedEntry] = []
         var failingPackages: Set<String> = []
+        var failingPackageIDs: Set<PackageIdentity> = []
         var fetchDelay: TimeInterval = 0
+        var updateDelay: TimeInterval = 0
         var autoFlags: [String: Bool] = [:]
         /// fetch 收到输出行时的回调(模拟运行中用户点取消)
         var onFetchLine: (() -> Void)?
         var onInstall: (() -> Void)?
         private(set) var fetchedNames: [String] = []
+        private(set) var fetchedPackageIDs: [PackageIdentity] = []
         private(set) var installedNames: [String] = []
+        private(set) var installedPackageIDs: [PackageIdentity] = []
+        private(set) var outdatedCallCount = 0
         private(set) var cleanupCalled = false
 
         func update(onLine: @escaping (String) -> Void) async throws {
             if let updateError { throw updateError }
+            if updateDelay > 0 {
+                try await Task.sleep(nanoseconds: UInt64(updateDelay * 1_000_000_000))
+            }
         }
 
         func outdatedAll(greedy: Bool) async throws -> [OutdatedEntry] {
+            outdatedCallCount += 1
             if let outdatedError { throw outdatedError }
             return outdatedResult
         }
 
         func fetch(package: OutdatedEntry, onLine: @escaping (String) -> Void, onProgress: @escaping (Int64, Int64, Double) -> Void) async throws {
             fetchedNames.append(package.name)
+            fetchedPackageIDs.append(package.identity)
             onLine("mock download \(package.name)")
             onFetchLine?()
             if fetchDelay > 0 {
                 try? await Task.sleep(nanoseconds: UInt64(fetchDelay * 1_000_000_000))
             }
             if Task.isCancelled { throw CancellationError() }
-            if failingPackages.contains(package.name) {
+            if failingPackages.contains(package.name) || failingPackageIDs.contains(package.identity) {
                 throw NSError(domain: "mock", code: 1, userInfo: [NSLocalizedDescriptionKey: "模拟下载失败"])
             }
             onProgress(100, 100, 0)
@@ -46,6 +56,7 @@ final class UpdateEngineFlowTests: XCTestCase {
 
         func install(package: OutdatedEntry, onLine: @escaping (String) -> Void) async throws {
             installedNames.append(package.name)
+            installedPackageIDs.append(package.identity)
             onInstall?()
         }
 
@@ -68,9 +79,18 @@ final class UpdateEngineFlowTests: XCTestCase {
     }
 
     private func makeEngine(_ mock: MockBrew) -> UpdateEngine {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("brewua-flow-\(UUID().uuidString).json")
-        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
-        return UpdateEngine(services: mock, history: HistoryService(fileURL: url))
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("brewua-flow-\(UUID().uuidString)", isDirectory: true)
+        let url = directory.appendingPathComponent("history.json")
+        let config = ConfigService(fileURL: directory.appendingPathComponent("ignored_casks"))
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        return UpdateEngine(services: mock, history: HistoryService(fileURL: url), config: config)
+    }
+
+    private func waitForIdle(_ engine: UpdateEngine) async {
+        for _ in 0..<300 {
+            if !engine.isRunning { return }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
     }
 
     // MARK: - 用例
@@ -191,6 +211,84 @@ final class UpdateEngineFlowTests: XCTestCase {
         XCTAssertEqual(mock.installedNames, ["wget"])
         XCTAssertEqual(engine.phase, .canceled)
         XCTAssertEqual(engine.pendingUpdates.map(\.name), ["jq"])
+    }
+
+    func testSameNameFormulaAndCaskHaveIndependentTasksAndPendingIdentity() async {
+        let mock = MockBrew()
+        let formula = entry("shared", kind: .formula)
+        let cask = entry("shared", kind: .cask)
+        mock.outdatedResult = [formula, cask]
+        mock.failingPackageIDs = [PackageIdentity(kind: .cask, name: "shared")]
+        let engine = makeEngine(mock)
+        _ = await engine.fetchOutdated(options: UpdateOptions())
+        await engine.runPhase1And2(entries: mock.outdatedResult, startTime: Date())
+
+        XCTAssertEqual(mock.fetchedPackageIDs, [formula.identity, cask.identity])
+        XCTAssertEqual(mock.installedPackageIDs, [formula.identity])
+        XCTAssertEqual(engine.tasks.count, 2)
+        XCTAssertEqual(engine.tasks.first(where: { $0.identity == formula.identity })?.status, .succeeded)
+        XCTAssertEqual(engine.tasks.first(where: { $0.identity == cask.identity })?.status.isTerminal, true)
+        XCTAssertEqual(engine.pendingUpdates.map(\.identity), [cask.identity],
+                       "formula 成功不能误删同名 cask 的剩余更新")
+    }
+
+    func testRetryPreservesOriginalVersionHistory() async throws {
+        let mock = MockBrew()
+        mock.failingPackages = ["retry-me"]
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("brewua-retry-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let history = HistoryService(fileURL: directory.appendingPathComponent("history.json"))
+        let config = ConfigService(fileURL: directory.appendingPathComponent("ignored_casks"))
+        let engine = UpdateEngine(services: mock, history: history, config: config)
+        let entry = OutdatedEntry(name: "retry-me", currentVersion: "1.0", newestVersion: "2.0",
+                                  kind: .formula, isIgnored: false)
+        engine.upgrade(packages: [entry])
+        await waitForIdle(engine)
+        XCTAssertEqual(history.load().first?.entries.first?.fromVersion, "1.0")
+        XCTAssertEqual(history.load().first?.entries.first?.toVersion, "2.0")
+
+        mock.failingPackages = []
+        engine.retryFailed()
+        await waitForIdle(engine)
+        XCTAssertEqual(history.load().first?.entries.first?.fromVersion, "1.0")
+        XCTAssertEqual(history.load().first?.entries.first?.toVersion, "2.0")
+    }
+
+    func testNewIgnoreRuleIsRecheckedBeforeStartingSelectedPackages() async throws {
+        let mock = MockBrew()
+        let formula = entry("newly-ignored", kind: .formula)
+        mock.outdatedResult = [formula]
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("brewua-ignore-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config = ConfigService(fileURL: directory.appendingPathComponent("ignored_casks"))
+        let engine = UpdateEngine(services: mock, config: config)
+        _ = await engine.fetchOutdated(options: UpdateOptions())
+        try config.addIgnored(formula.name, kind: formula.kind)
+
+        engine.upgrade(packages: [formula])
+
+        XCTAssertTrue(mock.fetchedNames.isEmpty)
+        XCTAssertTrue(engine.pendingUpdates.isEmpty)
+        XCTAssertFalse(engine.isRunning)
+    }
+
+    func testCancelDuringUpdateStopsBeforeOutdatedQuery() async {
+        let mock = MockBrew()
+        mock.updateDelay = 30
+        let engine = makeEngine(mock)
+        engine.checkOnly()
+        for _ in 0..<100 {
+            if engine.phase == .updatingTaps { break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        engine.cancel()
+        await waitForIdle(engine)
+
+        XCTAssertEqual(engine.phase, .canceled)
+        XCTAssertEqual(mock.outdatedCallCount, 0)
+        XCTAssertFalse(engine.isRunning)
     }
 
 }

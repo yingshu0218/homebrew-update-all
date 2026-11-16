@@ -15,12 +15,29 @@ enum LineEvent {
 enum ProcessError: Error, LocalizedError {
     case spawnFailed(String)
     case terminated(code: Int32)
+    case timedOut(seconds: TimeInterval)
 
     var errorDescription: String? {
         switch self {
         case .spawnFailed(let cmd): return "无法启动进程: \(cmd)"
         case .terminated(let code): return "进程异常退出(\(code))"
+        case .timedOut(let seconds): return "进程运行超时(\(Int(seconds)) 秒)"
         }
+    }
+}
+
+struct ProcessResult {
+    let stdout: String
+    let stderr: String
+    let exitCode: Int32?
+    let timedOut: Bool
+    let cancelled: Bool
+    let streamSucceeded: Bool
+
+    var success: Bool { streamSucceeded && !timedOut && !cancelled && exitCode == 0 }
+    /// 用于错误提示的兼容汇总；结构化数据调用方应只读取 stdout。
+    var output: String {
+        [stdout, stderr].filter { !$0.isEmpty }.joined(separator: stdout.isEmpty || stderr.isEmpty ? "" : "\n")
     }
 }
 
@@ -47,8 +64,9 @@ final class LineAggregator {
         pendingData.append(data)
         // 只解码完整 UTF-8 序列,尾部不完整字节留待下一个 chunk
         let (safeLength, _) = Self.utf8SafeSplit(pendingData)
-        guard safeLength > 0,
-              let decoded = String(data: pendingData.prefix(safeLength), encoding: .utf8) else { return }
+        guard safeLength > 0 else { return }
+        // 替换已确定非法的 UTF-8 字节，不能让单个坏字节卡住后续日志。
+        let decoded = String(decoding: pendingData.prefix(safeLength), as: UTF8.self)
         lineBuffer += decoded
         pendingData = pendingData.count > safeLength ? Data(pendingData.suffix(pendingData.count - safeLength)) : Data()
         flushLinesLocked()
@@ -60,7 +78,7 @@ final class LineAggregator {
         defer { lock.unlock() }
         if !pendingData.isEmpty {
             // 最后残余即使不完整也尽力解码(容错)
-            lineBuffer += String(data: pendingData, encoding: .utf8) ?? ""
+            lineBuffer += String(decoding: pendingData, as: UTF8.self)
             pendingData = Data()
         }
         if !lineBuffer.isEmpty {
@@ -128,8 +146,24 @@ final class StreamedProcess {
     var arguments: [String]
     var environment: [String: String]
     private(set) var process: Process?
-    /// 退出码(terminationHandler 触发后可读;nil = 尚未退出)
-    private(set) var terminationStatus: Int32?
+    private let statusLock = NSLock()
+    private var storedTerminationStatus: Int32?
+    private(set) var terminationStatus: Int32? {
+        get {
+            statusLock.lock()
+            defer { statusLock.unlock() }
+            return storedTerminationStatus
+        }
+        set {
+            statusLock.lock()
+            storedTerminationStatus = newValue
+            statusLock.unlock()
+        }
+    }
+    private let terminationLock = NSLock()
+    private var terminationRequested = false
+    private var pipeDrainCompleted = false
+    private var terminationWaiters: [CheckedContinuation<Void, Never>] = []
 
     // MARK: - 活跃进程登记(供 App 退出时精准终止,替代误伤面过大的 pkill -f)
 
@@ -160,6 +194,9 @@ final class StreamedProcess {
             if !groupKilled {
                 kill(pid, SIGTERM)
             }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                if kill(-pid, SIGKILL) != 0 { kill(pid, SIGKILL) }
+            }
         }
     }
 
@@ -177,26 +214,25 @@ final class StreamedProcess {
         self.environment = environment
     }
 
-    convenience init(brewArguments: [String], environment: [String: String] = StreamedProcess.brewEnv) {
-        // 用 python3 setsid 包装成会话领导者,使 brew 及子孙进程同组,可整组 kill
-        // (等价 zsh 源的 os.setsid() 包装;GUI 无法保证 Process 有 processGroup 属性)
-        //
-        // setsid 不是硬依赖:部分环境(以 responsibility 进程 / GUI app 启动的子进程)
-        // 会抛 PermissionError: Operation not permitted。此时降级为直接 execv,
-        // 命令照常执行,仅"整组终止"能力降级(见 run() 的 kill 兜底)。
+    convenience init(brewArguments: [String], environment: [String: String] = StreamedProcess.brewEnv,
+                     brewPath: String? = nil) {
+        // Foundation.Process 通常已把子进程设为进程组长；只有不是组长时才调用 setsid。
+        // exec 保留 PID/PGID，使整个 brew 子进程树可按本次进程组精确回收。
         let runner = """
         import os, sys
-        try:
-            os.setsid()
-        except OSError:
-            pass
+        if os.getpgrp() != os.getpid():
+            try:
+                os.setsid()
+            except OSError as error:
+                os.write(2, ("cannot create isolated brew process group: " + str(error) + "\\n").encode())
+                sys.exit(126)
         os.execv(sys.argv[1], sys.argv[1:])
         """
-        let brewPath = StreamedProcess.brewExecutablePath()
+        let selectedBrewPath = brewPath ?? StreamedProcess.brewExecutablePath()
         let python = URL(fileURLWithPath: "/usr/bin/python3")
         self.init(
             executableURL: python,
-            arguments: ["-c", runner, brewPath] + brewArguments,
+            arguments: ["-c", runner, selectedBrewPath] + brewArguments,
             environment: environment
         )
     }
@@ -213,7 +249,140 @@ final class StreamedProcess {
     /// 运行进程,流式产出输出行,直到进程结束。
     /// - 若进程以非 0 退出,流在末尾抛出 `terminated`。
     /// - 用 `Task` 包裹可随时 `cancel()`(会终止进程)。
-    func run() -> AsyncThrowingStream<LineEvent, Error> {
+    func run(timeout: TimeInterval? = nil) -> AsyncThrowingStream<LineEvent, Error> {
+        let source = runUnbounded()
+        return AsyncThrowingStream { continuation in
+            let worker = Task {
+                do {
+                    let completed = try await withThrowingTaskGroup(of: Bool.self) { group in
+                        group.addTask {
+                            for try await event in source {
+                                continuation.yield(event)
+                            }
+                            return !Task.isCancelled
+                        }
+                        if let timeout {
+                            group.addTask {
+                                do {
+                                    try await Task.sleep(nanoseconds: UInt64(max(timeout, 0) * 1_000_000_000))
+                                    return false
+                                } catch {
+                                    return true
+                                }
+                            }
+                        }
+                        let completed = try await group.next() ?? false
+                        group.cancelAll()
+                        if !completed { await self.terminateAndWait() }
+                        try? await group.waitForAll()
+                        return completed
+                    }
+                    if completed {
+                        continuation.finish()
+                    } else if Task.isCancelled {
+                        continuation.finish(throwing: CancellationError())
+                    } else if let timeout {
+                        continuation.finish(throwing: ProcessError.timedOut(seconds: timeout))
+                    } else {
+                        continuation.finish(throwing: CancellationError())
+                    }
+                } catch {
+                    await self.terminateAndWait()
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { termination in
+                if case .cancelled = termination { worker.cancel() }
+            }
+        }
+    }
+
+    /// 终止本次进程组并等待组内进程全部退出、stdout/stderr 管道完全排空。
+    /// 调用方必须在释放 BrewGate 前等待此方法完成。
+    func terminateAndWait() async {
+        guard let process, process.processIdentifier > 0 else { return }
+        let pid = process.processIdentifier
+        requestTermination(pid: pid, process: process)
+        let graceDeadline = Date().addingTimeInterval(2)
+        while isProcessGroupAlive(pid) || process.isRunning {
+            if Date() >= graceDeadline {
+                if kill(-pid, SIGKILL) != 0 && process.isRunning {
+                    kill(pid, SIGKILL)
+                }
+                break
+            }
+            await sleepUncancelably(nanoseconds: 40_000_000)
+        }
+        // The session leader can exit while a descendant keeps running after closing both pipes.
+        // Wait for the whole group to disappear after SIGKILL before releasing the brew gate.
+        while isProcessGroupAlive(pid) || process.isRunning {
+            await sleepUncancelably(nanoseconds: 40_000_000)
+        }
+        await waitForPipeDrain()
+    }
+
+    func waitUntilTerminated() async {
+        await waitForPipeDrain()
+    }
+
+    private func requestTermination(pid: Int32, process: Process) {
+        terminationLock.lock()
+        let shouldSendSignal = !terminationRequested
+        if shouldSendSignal { terminationRequested = true }
+        terminationLock.unlock()
+        guard shouldSendSignal else { return }
+
+        if kill(-pid, SIGTERM) != 0 { kill(pid, SIGTERM) }
+        // 后台兜底也按组存活状态 KILL；不依赖已退出的 session leader 的 isRunning。
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+            if Self.isProcessGroupAlive(pid) {
+                kill(-pid, SIGKILL)
+            } else if process.isRunning {
+                kill(pid, SIGKILL)
+            }
+        }
+    }
+
+    private static func isProcessGroupAlive(_ pid: Int32) -> Bool {
+        if kill(-pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    private func isProcessGroupAlive(_ pid: Int32) -> Bool {
+        Self.isProcessGroupAlive(pid)
+    }
+
+    private func sleepUncancelably(nanoseconds: UInt64) async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global().asyncAfter(deadline: .now() + Double(nanoseconds) / 1_000_000_000) {
+                continuation.resume()
+            }
+        }
+    }
+
+    private func waitForPipeDrain() async {
+        await withCheckedContinuation { continuation in
+            terminationLock.lock()
+            if pipeDrainCompleted {
+                terminationLock.unlock()
+                continuation.resume()
+            } else {
+                terminationWaiters.append(continuation)
+                terminationLock.unlock()
+            }
+        }
+    }
+
+    private func markPipeDrainCompleted() {
+        terminationLock.lock()
+        pipeDrainCompleted = true
+        let waiters = terminationWaiters
+        terminationWaiters.removeAll()
+        terminationLock.unlock()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func runUnbounded() -> AsyncThrowingStream<LineEvent, Error> {
         AsyncThrowingStream { continuation in
             let p = Process()
             self.process = p
@@ -228,32 +397,44 @@ final class StreamedProcess {
 
             let outAggregator = LineAggregator { continuation.yield(.stdout($0)) }
             let errAggregator = LineAggregator { continuation.yield(.stderr($0)) }
+            let outReadLock = NSLock()
+            let errReadLock = NSLock()
 
             p.terminationHandler = { proc in
                 self.terminationStatus = proc.terminationStatus
-                // 停止异步读取后,同步读完管道残余再收流。
-                // (旧实现直接置 nil 收流:内核缓冲里未消费的数据全部丢失,大 JSON 尾部被截断)
+                // 先停止新回调，再分别等待正在进行的读取完成并 drain 尾部。
+                // 锁使 readabilityHandler 与 terminationHandler 不会并发消耗/重排同一管道。
                 outPipe.fileHandleForReading.readabilityHandler = nil
                 errPipe.fileHandleForReading.readabilityHandler = nil
+                outReadLock.lock()
                 let outRest = outPipe.fileHandleForReading.readDataToEndOfFile()
-                let errRest = errPipe.fileHandleForReading.readDataToEndOfFile()
                 outAggregator.consume(outRest)
-                errAggregator.consume(errRest)
                 outAggregator.flush()
+                outReadLock.unlock()
+                errReadLock.lock()
+                let errRest = errPipe.fileHandleForReading.readDataToEndOfFile()
+                errAggregator.consume(errRest)
                 errAggregator.flush()
+                errReadLock.unlock()
                 if proc.terminationStatus == 0 {
                     continuation.finish()
                 } else {
                     continuation.finish(throwing: ProcessError.terminated(code: proc.terminationStatus))
                 }
+                self.markPipeDrainCompleted()
+                StreamedProcess.unregisterActive(pid: proc.processIdentifier)
             }
 
             outPipe.fileHandleForReading.readabilityHandler = { handle in
+                outReadLock.lock()
+                defer { outReadLock.unlock() }
                 let data = handle.availableData
                 guard !data.isEmpty else { return }
                 outAggregator.consume(data)
             }
             errPipe.fileHandleForReading.readabilityHandler = { handle in
+                errReadLock.lock()
+                defer { errReadLock.unlock() }
                 let data = handle.availableData
                 guard !data.isEmpty else { return }
                 errAggregator.consume(data)
@@ -262,29 +443,21 @@ final class StreamedProcess {
             do {
                 try p.run()
                 StreamedProcess.registerActive(pid: p.processIdentifier)
+                self.terminationLock.lock()
+                let alreadyDrained = self.pipeDrainCompleted
+                self.terminationLock.unlock()
+                if alreadyDrained { StreamedProcess.unregisterActive(pid: p.processIdentifier) }
             } catch {
                 continuation.finish(throwing: ProcessError.spawnFailed("\(executableURL.path) \(arguments.joined(separator: " "))"))
                 return
             }
 
-            continuation.onTermination = { @Sendable _ in
+            continuation.onTermination = { @Sendable termination in
+                guard case .cancelled = termination else { return }
                 let pid = p.processIdentifier
-                StreamedProcess.unregisterActive(pid: pid)
                 if pid > 0 {
-                    // setsid 成功时子进程是新会话组长,-pid 可整组终止;
-                    // setsid 被拒时子进程在原进程组,组终止会 EPERM,降级杀主进程。
-                    let groupKilled = kill(-pid, SIGTERM) == 0
-                    if !groupKilled {
-                        kill(pid, SIGTERM)
-                    }
-                    // 给进程 2 秒从容退出,再强杀
-                    DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                        if p.isRunning {
-                            if kill(-pid, SIGKILL) != 0 {
-                                kill(pid, SIGKILL)
-                            }
-                        }
-                    }
+                    self.requestTermination(pid: pid, process: p)
+                    Task { await self.terminateAndWait() }
                 }
             }
         }
@@ -294,59 +467,85 @@ final class StreamedProcess {
 
     /// 聚合运行公共实现:收集输出 + (可选)超时竞速。
     /// - Returns: (全部输出, 退出是否成功;nil 表示超时被终止)
-    private func collect(timeout: TimeInterval?) async -> (output: String, success: Bool?) {
+    private func collect(timeout: TimeInterval?) async -> ProcessResult {
         enum RaceOutcome {
-            case finished(String, Bool)
+            case finished(String, String, Bool, Int32?, Bool)
             case timedOut
+            case canceled
         }
         let stream = run()
         return await withTaskGroup(of: RaceOutcome.self) { group in
             group.addTask {
-                var collected = ""
+                var stdout = ""
+                var stderr = ""
                 var ok = true
                 do {
                     for try await event in stream {
-                        collected += event.text + "\n"
+                        switch event {
+                        case .stdout(let line): stdout += line + "\n"
+                        case .stderr(let line): stderr += line + "\n"
+                        }
                     }
                 } catch {
-                    // 非 0 退出也保留收集到的输出(如 brew doctor),上层按输出判定
+                    // 非 0 退出也保留两条管道的内容供上层显示。
                     ok = false
                 }
-                return .finished(collected, ok)
+                let cancelled = Task.isCancelled
+                return .finished(stdout, stderr, ok && !cancelled, self.terminationStatus, cancelled)
             }
             if let timeout {
                 group.addTask {
-                    try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                    return .timedOut
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(max(timeout, 0) * 1_000_000_000))
+                        return .timedOut
+                    } catch {
+                        return .canceled
+                    }
                 }
             }
             let first = await group.next() ?? .timedOut
             group.cancelAll()
+            if Task.isCancelled { await self.terminateAndWait() }
             switch first {
-            case .finished(let output, let ok):
-                return (output, ok)
+            case .finished(let stdout, let stderr, let ok, let exitCode, let cancelled):
+                return ProcessResult(stdout: stdout, stderr: stderr, exitCode: exitCode,
+                                     timedOut: false, cancelled: cancelled, streamSucceeded: ok)
             case .timedOut:
-                // 超时:取消收集任务(取消触发 onTermination 杀进程组),等待其返回已收集部分
+                // 超时/调用方取消：取消收集任务会终止进程组；等待它回收并取回部分输出。
+                await self.terminateAndWait()
                 let partial = await group.next()
-                if case .finished(let output, _)? = partial {
-                    return (output, false)
+                if case .finished(let stdout, let stderr, let ok, let exitCode, let cancelled)? = partial {
+                    return ProcessResult(stdout: stdout, stderr: stderr, exitCode: exitCode,
+                                         timedOut: true, cancelled: cancelled, streamSucceeded: ok)
                 }
-                return ("", false)
+                return ProcessResult(stdout: "", stderr: "", exitCode: nil,
+                                     timedOut: true, cancelled: false, streamSucceeded: false)
+            case .canceled:
+                await self.terminateAndWait()
+                let partial = await group.next()
+                if case .finished(let stdout, let stderr, let ok, let exitCode, let cancelled)? = partial {
+                    return ProcessResult(stdout: stdout, stderr: stderr, exitCode: exitCode,
+                                         timedOut: false, cancelled: cancelled, streamSucceeded: ok)
+                }
+                return ProcessResult(stdout: "", stderr: "", exitCode: nil,
+                                     timedOut: false, cancelled: true, streamSucceeded: false)
             }
         }
     }
 
     /// 同步运行并聚合全部输出(用于 info/version 等轻量命令)。
-    /// 超时会取消进程并返回已收集内容(旧语义保留:非 0 退出也返回输出,上层按输出判定)。
+    /// 超时、取消和非零退出均抛错；输出仍可由 runSyncChecked 取回用于诊断。
     func runSync(timeout: TimeInterval = 30) async throws -> String {
-        let (output, _) = await collect(timeout: timeout)
-        return output
+        let result = await collect(timeout: timeout)
+        if result.timedOut { throw ProcessError.timedOut(seconds: timeout) }
+        if result.cancelled { throw CancellationError() }
+        guard result.success else { throw ProcessError.terminated(code: result.exitCode ?? -1) }
+        return result.output
     }
 
     /// 同步运行并返回 (聚合输出, 是否成功退出)。
     /// 需要区分成败的调用方(uninstall 等)用这个;超时/非 0 均判定为失败。
-    func runSyncChecked(timeout: TimeInterval = 120) async -> (output: String, success: Bool) {
-        let (output, success) = await collect(timeout: timeout)
-        return (output, success ?? false)
+    func runSyncChecked(timeout: TimeInterval = 120) async -> ProcessResult {
+        await collect(timeout: timeout)
     }
 }

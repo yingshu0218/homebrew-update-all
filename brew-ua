@@ -65,9 +65,9 @@ ${C_BOLD}升级模式:${C_RESET}
 
 ${C_BOLD}子命令:${C_RESET}
   ${C_PRIMARY}ck / check${C_RESET}              运行环境诊断
-  ${C_PRIMARY}ig / ignore <cask>${C_RESET}       屏蔽指定 cask
-  ${C_PRIMARY}uig / unignore <cask>${C_RESET}    解除屏蔽
-  ${C_PRIMARY}igl / ignored${C_RESET}            查看屏蔽列表
+  ${C_PRIMARY}ig / ignore [--formula] <name>${C_RESET}    屏蔽包（默认 cask）
+  ${C_PRIMARY}uig / unignore [--formula] <name>${C_RESET} 解除屏蔽（默认 cask）
+  ${C_PRIMARY}igl / ignored${C_RESET}                      查看屏蔽列表
 
 ${C_BOLD}选项:${C_RESET}
   ${C_PRIMARY}-a${C_RESET}           包含自带自动更新的 cask（--greedy）
@@ -80,8 +80,9 @@ ${C_BOLD}示例:${C_RESET}
   brew ua f                   只升级 formula
   brew ua c -a                只升级 cask（含自动更新的应用）
   brew ua ck                  运行环境诊断
-  brew ua ig firefox          屏蔽 firefox
-  brew ua uig firefox         解除 firefox 屏蔽
+  brew ua ig firefox          屏蔽 cask firefox
+  brew ua ig --formula wget   屏蔽 formula wget
+  brew ua uig firefox         解除 cask firefox 屏蔽
   brew ua igl                 查看屏蔽列表
 EOF
 }
@@ -271,9 +272,9 @@ function _check_network() {
   # 代理检测
   echo -n "  ${C_MUTED}代理设置:${C_RESET}  "
   local proxy_set=""
-  [[ -n "$http_proxy" ]] && proxy_set="http_proxy"
-  [[ -n "$https_proxy" ]] && proxy_set="${proxy_set:+,}https_proxy"
-  [[ -n "$ALL_PROXY" ]] && proxy_set="${proxy_set:+,}ALL_PROXY"
+  [[ -n "${http_proxy:-}" ]] && proxy_set="http_proxy"
+  [[ -n "${https_proxy:-}" ]] && proxy_set="${proxy_set:+,}https_proxy"
+  [[ -n "${ALL_PROXY:-}" ]] && proxy_set="${proxy_set:+,}ALL_PROXY"
   if [[ -n "$proxy_set" ]]; then
     echo "${C_SUCCESS}已配置${C_RESET} ${C_MUTED}($proxy_set)${C_RESET}"
   else
@@ -382,9 +383,9 @@ function _check_local() {
 
   # 环境变量
   local env_vars=""
-  [[ -n "$HOMEBREW_NO_AUTO_UPDATE" ]] && env_vars="${env_vars:+,}NO_AUTO_UPDATE"
-  [[ -n "$HOMEBREW_BOTTLE_DOMAIN" ]] && env_vars="${env_vars:+,}BOTTLE_DOMAIN"
-  [[ -n "$HOMEBREW_CORE_GIT_REMOTE" ]] && env_vars="${env_vars:+,}CORE_GIT_REMOTE"
+  [[ -n "${HOMEBREW_NO_AUTO_UPDATE:-}" ]] && env_vars="${env_vars:+,}NO_AUTO_UPDATE"
+  [[ -n "${HOMEBREW_BOTTLE_DOMAIN:-}" ]] && env_vars="${env_vars:+,}BOTTLE_DOMAIN"
+  [[ -n "${HOMEBREW_CORE_GIT_REMOTE:-}" ]] && env_vars="${env_vars:+,}CORE_GIT_REMOTE"
   if [[ -n "$env_vars" ]]; then
     echo "  ${C_MUTED}环境变量:${C_RESET}     ${C_INFO}已设置${C_RESET} ${C_MUTED}($env_vars)${C_RESET}"
   fi
@@ -466,44 +467,94 @@ IGNORED_FILE="$HOME/.config/brew-ua/ignored_casks"
 function _ensure_ignored_file() {
   local dir
   dir=$(dirname "$IGNORED_FILE")
-  [[ ! -d "$dir" ]] && mkdir -p "$dir"
-  [[ ! -f "$IGNORED_FILE" ]] && touch "$IGNORED_FILE"
+  mkdir -p "$dir" 2>/dev/null || return 2
+  if [[ ! -f "$IGNORED_FILE" ]]; then
+    : > "$IGNORED_FILE" 2>/dev/null || return 2
+  fi
+  [[ -r "$IGNORED_FILE" ]] || return 2
+  return 0
 }
 
-function _is_cask_ignored() {
-  local cask_name="$1"
-  _ensure_ignored_file
-  grep -qxF "$cask_name" "$IGNORED_FILE" 2>/dev/null
-}
-
-function _add_ignored_cask() {
-  local cask_name="$1"
-  _ensure_ignored_file
-  if _is_cask_ignored "$cask_name"; then
-    return 1
+function _ignore_line_matches() {
+  local line="$1" kind="$2" name="$3"
+  local line_kind="cask" line_name="$line"
+  if [[ "$line" == formula:* ]]; then
+    line_kind="formula"
+    line_name="${line#formula:}"
+  fi
+  [[ "$line_kind" == "$kind" && -n "$line_name" ]] || return 1
+  if [[ "$line_name" == */* ]]; then
+    [[ "$line_name" == "$name" ]]
   else
-    echo "$cask_name" >> "$IGNORED_FILE"
-    return 0
+    [[ "$line_name" == "${name##*/}" ]]
   fi
 }
 
-function _remove_ignored_cask() {
-  local cask_name="$1"
-  _ensure_ignored_file
-  if _is_cask_ignored "$cask_name"; then
-    local tmp_file
-    tmp_file=$(mktemp)
-    grep -vxF "$cask_name" "$IGNORED_FILE" > "$tmp_file"
-    mv "$tmp_file" "$IGNORED_FILE"
-    return 0
+function _is_ignored() {
+  local kind="$1" name="$2" line
+  _ensure_ignored_file || return 2
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    _ignore_line_matches "$line" "$kind" "$name" && return 0
+  done < "$IGNORED_FILE"
+  return 1
+}
+
+function _ignore_key() {
+  local kind="$1" name="$2"
+  if [[ "$kind" == "formula" ]]; then
+    printf 'formula:%s' "$name"
   else
-    return 1
+    printf '%s' "$name"
   fi
 }
 
-function _list_ignored_casks() {
-  _ensure_ignored_file
-  cat "$IGNORED_FILE"
+function _write_ignored_entries() {
+  local dir tmp_file
+  local -a entries=("$@")
+  dir=$(dirname "$IGNORED_FILE")
+  tmp_file=$(mktemp "$dir/.ignored_casks.XXXXXX") || return 1
+  if (( ${#entries[@]} > 0 )); then
+    printf '%s\n' "${entries[@]}" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+  else
+    : > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+  fi
+  mv -f "$tmp_file" "$IGNORED_FILE" || { rm -f "$tmp_file"; return 1; }
+}
+
+function _add_ignored() {
+  local kind="$1" name="$2" key line match_rc
+  local -a entries=()
+  _ensure_ignored_file || return 2
+  _is_ignored "$kind" "$name"
+  match_rc=$?
+  (( match_rc == 0 )) && return 1
+  (( match_rc > 1 )) && return 2
+  key=$(_ignore_key "$kind" "$name")
+  while IFS= read -r line || [[ -n "$line" ]]; do entries+=("$line"); done < "$IGNORED_FILE"
+  entries+=("$key")
+  _write_ignored_entries "${entries[@]}" || return 2
+  return 0
+}
+
+function _remove_ignored() {
+  local kind="$1" name="$2" line removed=0
+  local -a entries=()
+  _ensure_ignored_file || return 2
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if _ignore_line_matches "$line" "$kind" "$name"; then
+      removed=1
+    else
+      entries+=("$line")
+    fi
+  done < "$IGNORED_FILE"
+  (( removed == 1 )) || return 1
+  _write_ignored_entries "${entries[@]}" || return 2
+  return 0
+}
+
+function _list_ignored_entries() {
+  _ensure_ignored_file || return 2
+  cat "$IGNORED_FILE" || return 2
 }
 
 function _count_ignored_casks() {
@@ -606,9 +657,47 @@ function _show_cursor() {
 }
 
 function _cleanup_and_exit() {
+  if [[ "${ACTIVE_OPERATION:-}" == "install" && -n "${ACTIVE_PROCESS_PID:-}" ]]; then
+    if (( INTERRUPT_REQUESTED == 0 )); then
+      INTERRUPT_REQUESTED=1
+      echo ""
+      echo "${C_WARN}  ⚠ 已请求取消；等待当前包安全完成后停止${C_RESET}"
+    fi
+    return 0
+  fi
+
+  trap '' INT TERM
+  if [[ -n "${ACTIVE_PROCESS_PGID:-}" ]]; then
+    _terminate_process_group "$ACTIVE_PROCESS_PGID" "${ACTIVE_PROCESS_PID:-}" 1
+  fi
   _show_cursor
   echo ""
   exit 130
+}
+
+function _terminate_process_group() {
+  local pgid="$1" pid="${2:-$1}" grace_seconds="${3:-1}"
+  [[ -n "$pgid" ]] || return 0
+  # The Python launcher calls setsid() before exec; its PID is registered as
+  # the process-group ID. Signal the group and launcher, then always reap it.
+  kill -TERM -- "-$pgid" 2>/dev/null || true
+  kill -TERM "$pid" 2>/dev/null || true
+  sleep "$grace_seconds"
+  kill -KILL -- "-$pgid" 2>/dev/null || true
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+function _log_file_for() {
+  local kind="$1" name="$2" digest log_file index_line
+  digest=$(printf '%s\0%s' "$kind" "$name" | python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())') || return 1
+  [[ -n "$digest" && -n "${TMP_BASE:-}" && -d "$TMP_BASE" ]] || return 1
+  log_file="$TMP_BASE/${kind}-${digest}.log"
+  index_line="${kind}"$'\t'"${name}"$'\t'"${log_file}"
+  if ! grep -Fqx "$index_line" "$TMP_BASE/log-index.tsv" 2>/dev/null; then
+    printf '%s\n' "$index_line" >> "$TMP_BASE/log-index.tsv" || return 1
+  fi
+  printf '%s' "$log_file"
 }
 
 function _cursor_up() {
@@ -717,7 +806,8 @@ function _run_fetch() {
   local fetch_flag=$([[ "$type" == "cask" ]] && echo "--cask" || echo "--formula")
   local type_color=$([[ "$type" == "cask" ]] && echo "$C_CASK" || echo "$C_FORMULA")
   local type_icon=$([[ "$type" == "cask" ]] && echo "📱" || echo "🍺")
-  local log_file="$TMP_BASE/$name.log"
+  local log_file
+  log_file=$(_log_file_for "$type" "$name") || return 1
   local fetch_timeout=${BREW_UA_FETCH_TIMEOUT:-600}
 
   # 回到3行块顶，画下载初始界面
@@ -731,22 +821,24 @@ function _run_fetch() {
   _progress_bar "$completed_size" "$total_size" "$(( current_idx - 1 ))" "$num_selected"
   _sub_progress_bar 0 0 "下载中..." 0
 
-  # 后台 fetch：python setsid 包装 script，使 fetch 自成进程组（超时整组 kill）
-  # （Homebrew 6.x 不接受 "brew --verbose fetch"，用环境变量 HOMEBREW_VERBOSE=1；
-  #   script 语法 macOS/Linux 不同，按平台分支）
+  # 后台 fetch：Python launcher 先建立独立会话，再直接 exec env/brew。
+  # 不经 script 包装，确保 macOS 上实际 brew 与后代仍属于登记的进程组。
+  # Homebrew 6.x 的 verbose 开关通过 HOMEBREW_VERBOSE 环境变量传入。
   local fetch_pid
   python3 - "$fetch_flag" "$name" > "$log_file" 2>&1 << 'PYEOF' &
-import os, sys, platform
+import os, sys
 fetch_flag, name = sys.argv[1], sys.argv[2]
-inner = ["env", "HOMEBREW_VERBOSE=1", "brew", "fetch", fetch_flag, name]
-if platform.system() == "Darwin":
-    cmd = ["/usr/bin/script", "-e", "-q", "/dev/null"] + inner
-else:
-    cmd = ["/usr/bin/script", "-qec", " ".join(inner), "/dev/null"]
+inner = ["env", "HOMEBREW_VERBOSE=1", "brew", "fetch", fetch_flag]
+if fetch_flag == "--formula":
+    inner.append("--deps")
+inner.append(name)
 os.setsid()
-os.execv(cmd[0], cmd)
+os.execvp(inner[0], inner)
 PYEOF
   fetch_pid=$!
+  ACTIVE_PROCESS_PID="$fetch_pid"
+  ACTIVE_PROCESS_PGID="$fetch_pid"
+  ACTIVE_OPERATION="download"
 
   # 下载轮询：监控缓存文件大小增长（真实磁盘写入）算速度/进度；日志 "Downloading X/Y" 帧作为补充
   spin_idx=0
@@ -760,10 +852,10 @@ PYEOF
   while kill -0 "$fetch_pid" 2>/dev/null; do
     # 超时检查：超过 BREW_UA_FETCH_TIMEOUT 秒则整组终止
     if (( $(date +%s) - fetch_start > fetch_timeout )); then
-      kill -TERM -- -$fetch_pid 2>/dev/null
-      sleep 2
-      kill -KILL -- -$fetch_pid 2>/dev/null
-      wait "$fetch_pid" 2>/dev/null
+      _terminate_process_group "$fetch_pid" "$fetch_pid" 2
+      ACTIVE_PROCESS_PID=""
+      ACTIVE_PROCESS_PGID=""
+      ACTIVE_OPERATION=""
       timed_out=1
       break
     fi
@@ -838,6 +930,9 @@ PYEOF
 
   wait "$fetch_pid"
   local fetch_exit=$?
+  ACTIVE_PROCESS_PID=""
+  ACTIVE_PROCESS_PGID=""
+  ACTIVE_OPERATION=""
   if (( fetch_exit != 0 )); then
     return 1
   fi
@@ -889,33 +984,57 @@ if [[ "${1:-}" == "ck" || "${1:-}" == "check" ]]; then
   exit 0
 fi
 
-# ig / ignore — 屏蔽 cask
+# ig / ignore — 屏蔽指定类型的包（默认 cask）
 if [[ "${1:-}" == "ig" || "${1:-}" == "ignore" ]]; then
-  if [[ -z "${2:-}" ]]; then
-    echo "${C_ERROR}  ✗ 请指定要屏蔽的 cask 名称${C_RESET}"
-    echo "  用法: brew ua ig <cask-name>"
+  shift
+  ignore_kind="cask"
+  if [[ "${1:-}" == "--formula" ]]; then
+    ignore_kind="formula"
+    shift
+  fi
+  if [[ -z "${1:-}" ]]; then
+    echo "${C_ERROR}  ✗ 请指定要屏蔽的包名称${C_RESET}"
+    echo "  用法: brew ua ig [--formula] <name>"
     exit 1
   fi
-  if _add_ignored_cask "$2"; then
-    echo "${C_SUCCESS}  ✓ 已屏蔽 cask: ${C_BOLD}$2${C_RESET}"
-    echo "${C_MUTED}  该 cask 将不会出现在更新列表中，直到手动解除屏蔽${C_RESET}"
+  ignore_name="$1"
+  _add_ignored "$ignore_kind" "$ignore_name"
+  ignore_rc=$?
+  if (( ignore_rc == 0 )); then
+    echo "${C_SUCCESS}  ✓ 已屏蔽 ${ignore_kind}: ${C_BOLD}${ignore_name}${C_RESET}"
+    echo "${C_MUTED}  该包将不会出现在更新列表中，直到手动解除屏蔽${C_RESET}"
+  elif (( ignore_rc == 1 )); then
+    echo "${C_WARN}  ⚠ ${ignore_kind} \"${ignore_name}\" 已经在屏蔽列表中${C_RESET}"
   else
-    echo "${C_WARN}  ⚠ cask \"$2\" 已经在屏蔽列表中${C_RESET}"
+    echo "${C_ERROR}  ✗ 无法写入屏蔽列表：${IGNORED_FILE}${C_RESET}" >&2
+    exit 1
   fi
   exit 0
 fi
 
-# uig / unignore — 解除屏蔽
+# uig / unignore — 解除指定类型的屏蔽（默认 cask）
 if [[ "${1:-}" == "uig" || "${1:-}" == "unignore" ]]; then
-  if [[ -z "${2:-}" ]]; then
-    echo "${C_ERROR}  ✗ 请指定要解除屏蔽的 cask 名称${C_RESET}"
-    echo "  用法: brew ua uig <cask-name>"
+  shift
+  ignore_kind="cask"
+  if [[ "${1:-}" == "--formula" ]]; then
+    ignore_kind="formula"
+    shift
+  fi
+  if [[ -z "${1:-}" ]]; then
+    echo "${C_ERROR}  ✗ 请指定要解除屏蔽的包名称${C_RESET}"
+    echo "  用法: brew ua uig [--formula] <name>"
     exit 1
   fi
-  if _remove_ignored_cask "$2"; then
-    echo "${C_SUCCESS}  ✓ 已解除屏蔽 cask: ${C_BOLD}$2${C_RESET}"
+  ignore_name="$1"
+  _remove_ignored "$ignore_kind" "$ignore_name"
+  ignore_rc=$?
+  if (( ignore_rc == 0 )); then
+    echo "${C_SUCCESS}  ✓ 已解除屏蔽 ${ignore_kind}: ${C_BOLD}${ignore_name}${C_RESET}"
+  elif (( ignore_rc == 1 )); then
+    echo "${C_WARN}  ⚠ ${ignore_kind} \"${ignore_name}\" 不在屏蔽列表中${C_RESET}"
   else
-    echo "${C_WARN}  ⚠ cask \"$2\" 不在屏蔽列表中${C_RESET}"
+    echo "${C_ERROR}  ✗ 无法更新屏蔽列表：${IGNORED_FILE}${C_RESET}" >&2
+    exit 1
   fi
   exit 0
 fi
@@ -923,18 +1042,29 @@ fi
 # igl / ignored — 查看屏蔽列表
 if [[ "${1:-}" == "igl" || "${1:-}" == "ignored" ]]; then
   local ignored_list
-  ignored_list=($(_list_ignored_casks))
+  ignored_output=$(_list_ignored_entries)
+  if (( $? != 0 )); then
+    echo "${C_ERROR}  ✗ 无法读取屏蔽列表：${IGNORED_FILE}${C_RESET}" >&2
+    exit 1
+  fi
+  ignored_list=()
+  [[ -n "$ignored_output" ]] && ignored_list=("${(@f)ignored_output}")
   local count=${#ignored_list[@]}
   if (( count == 0 )); then
-    echo "${C_INFO}  ℹ 当前没有屏蔽任何 cask${C_RESET}"
+    echo "${C_INFO}  ℹ 当前没有屏蔽任何包${C_RESET}"
   else
-    echo "${C_BOLD}🚫 屏蔽列表（${count} 个 cask）：${C_RESET}"
+    echo "${C_BOLD}🚫 屏蔽列表（${count} 个包）：${C_RESET}"
     echo ""
-    for c in "${ignored_list[@]}"; do
-      [[ -n "$c" ]] && echo "  ${C_CASK}•${C_RESET} ${c}"
+    for entry in "${ignored_list[@]}"; do
+      [[ -z "$entry" ]] && continue
+      if [[ "$entry" == formula:* ]]; then
+        echo "  ${C_FORMULA}•${C_RESET} formula: ${entry#formula:}"
+      else
+        echo "  ${C_CASK}•${C_RESET} cask: ${entry}"
+      fi
     done
     echo ""
-    echo "${C_MUTED}  解除屏蔽: brew ua uig <cask-name>${C_RESET}"
+    echo "${C_MUTED}  解除 cask: brew ua uig <name>；解除 formula: brew ua uig --formula <name>${C_RESET}"
   fi
   exit 0
 fi
@@ -962,8 +1092,32 @@ zmodload zsh/datetime 2>/dev/null
 zmodload zsh/mathfunc 2>/dev/null
 
 # 独立临时日志目录（避免 /tmp 固定文件名冲突与符号链接风险）
-TMP_BASE=$(mktemp -d "${TMPDIR:-/tmp}/brew-ua.XXXXXX" 2>/dev/null)
-[[ -z "$TMP_BASE" || ! -d "$TMP_BASE" ]] && TMP_BASE="/tmp"
+TMP_BASE_CREATED=0
+TMP_ROOT="${TMPDIR:-/tmp}"
+if [[ ! -d "$TMP_ROOT" ]]; then
+  echo "${C_ERROR}  ✗ 临时目录不可用：${TMP_ROOT}${C_RESET}" >&2
+  exit 1
+fi
+TMP_ROOT=$(cd "$TMP_ROOT" 2>/dev/null && pwd -P) || {
+  echo "${C_ERROR}  ✗ 无法解析临时目录：${TMPDIR:-/tmp}${C_RESET}" >&2
+  exit 1
+}
+TMP_BASE=$(mktemp -d "$TMP_ROOT/brew-ua.XXXXXX" 2>/dev/null) || {
+  echo "${C_ERROR}  ✗ 无法创建本次运行的临时目录${C_RESET}" >&2
+  exit 1
+}
+if [[ -z "$TMP_BASE" || ! -d "$TMP_BASE" || "${TMP_BASE:h}" != "$TMP_ROOT" || "${TMP_BASE:t}" != brew-ua.* ]]; then
+  echo "${C_ERROR}  ✗ mktemp 返回了不安全的临时目录路径${C_RESET}" >&2
+  exit 1
+fi
+TMP_BASE_CREATED=1
+
+ACTIVE_PROCESS_PID=""
+ACTIVE_PROCESS_PGID=""
+ACTIVE_OPERATION=""
+INTERRUPT_REQUESTED=0
+trap '_show_cursor' EXIT
+trap '_cleanup_and_exit' INT TERM
 
 # 当前版本（发版时同步更新；版本自检用）
 BREW_UA_VERSION="1.8.7"
@@ -986,12 +1140,17 @@ total_start=$(date +%s)
 _section_title "🔄" "更新 Homebrew 源"
 
 update_log="$TMP_BASE/update.log"
-brew update > "$update_log" 2>&1 &
+python3 - > "$update_log" 2>&1 <<'PYEOF' &
+import os
+os.setsid()
+os.execvp("brew", ["brew", "update"])
+PYEOF
 update_pid=$!
+ACTIVE_PROCESS_PID="$update_pid"
+ACTIVE_PROCESS_PGID="$update_pid"
+ACTIVE_OPERATION="update"
 
 _hide_cursor
-trap '_show_cursor' EXIT
-trap '_cleanup_and_exit' INT TERM
 
 update_start=$(date +%s)
 spin_idx=0
@@ -1022,6 +1181,9 @@ done
 
 wait "$update_pid"
 update_exit=$?
+ACTIVE_PROCESS_PID=""
+ACTIVE_PROCESS_PGID=""
+ACTIVE_OPERATION=""
 
 update_end=$(date +%s)
 update_dur=$(( update_end - update_start ))
@@ -1039,11 +1201,15 @@ if (( update_exit == 0 )); then
 else
   echo "${C_ERROR}  ✗ 源更新失败 · ${update_dur}s${C_RESET}"
   echo "${C_MUTED}  日志: ${update_log}${C_RESET}"
+  if [[ -f "$update_log" ]]; then cat "$update_log" >&2; fi
 fi
 
 _show_cursor
-trap - EXIT INT TERM
 (( update_exit == 0 )) && rm -f "$update_log"
+if (( update_exit != 0 )); then
+  echo "${C_ERROR}  ✗ brew update 失败，已停止升级流程${C_RESET}" >&2
+  exit 1
+fi
 
 # ---- 获取过期包列表 ----
 cask_extra_args=()
@@ -1051,35 +1217,71 @@ cask_extra_args=()
 
 formulae=()
 casks=()
+ignored_outdated_formulae=()
 ignored_outdated_casks=()
 
 local self_update_available=0
 
 if [[ "$filter" != "cask" ]]; then
   local all_outdated_formulae=()
-  all_outdated_formulae=($(brew outdated --formula --quiet))
+  local formula_query_log="$TMP_BASE/outdated-formula.log"
+  formula_query_output=$(brew outdated --formula --quiet 2> "$formula_query_log")
+  query_exit=$?
+  if (( query_exit != 0 )); then
+    echo "${C_ERROR}  ✗ 查询过期 formula 失败（退出码 ${query_exit}），已停止升级流程${C_RESET}" >&2
+    [[ -f "$formula_query_log" ]] && cat "$formula_query_log" >&2
+    echo "${C_MUTED}  日志: ${formula_query_log}${C_RESET}" >&2
+    exit 1
+  fi
+  [[ -n "$formula_query_output" ]] && all_outdated_formulae=("${(@f)formula_query_output}")
   for f in "${all_outdated_formulae[@]}"; do
+    [[ -z "$f" ]] && continue
     if [[ "$f" == "brew-update-all" ]]; then
       self_update_available=1
     else
-      formulae+=("$f")
+      _is_ignored "formula" "$f"
+      ignore_rc=$?
+      if (( ignore_rc == 0 )); then
+        ignored_outdated_formulae+=("$f")
+      elif (( ignore_rc == 1 )); then
+        formulae+=("$f")
+      else
+        echo "${C_ERROR}  ✗ 无法读取屏蔽列表：${IGNORED_FILE}${C_RESET}" >&2
+        exit 1
+      fi
     fi
   done
 fi
 if [[ "$filter" != "formula" ]]; then
-  all_outdated_casks=($(brew outdated --cask $cask_extra_args --quiet))
+  local all_outdated_casks=()
+  local cask_query_log="$TMP_BASE/outdated-cask.log"
+  cask_query_output=$(brew outdated --cask $cask_extra_args --quiet 2> "$cask_query_log")
+  query_exit=$?
+  if (( query_exit != 0 )); then
+    echo "${C_ERROR}  ✗ 查询过期 cask 失败（退出码 ${query_exit}），已停止升级流程${C_RESET}" >&2
+    [[ -f "$cask_query_log" ]] && cat "$cask_query_log" >&2
+    echo "${C_MUTED}  日志: ${cask_query_log}${C_RESET}" >&2
+    exit 1
+  fi
+  [[ -n "$cask_query_output" ]] && all_outdated_casks=("${(@f)cask_query_output}")
   for c in "${all_outdated_casks[@]}"; do
-    if _is_cask_ignored "$c"; then
+    [[ -z "$c" ]] && continue
+    _is_ignored "cask" "$c"
+    ignore_rc=$?
+    if (( ignore_rc == 0 )); then
       ignored_outdated_casks+=("$c")
-    else
+    elif (( ignore_rc == 1 )); then
       casks+=("$c")
+    else
+      echo "${C_ERROR}  ✗ 无法读取屏蔽列表：${IGNORED_FILE}${C_RESET}" >&2
+      exit 1
     fi
   done
 fi
 
 num_f=${#formulae[@]}
 num_c=${#casks[@]}
-num_ignored=${#ignored_outdated_casks[@]}
+num_ignored=$((${#ignored_outdated_formulae[@]} + ${#ignored_outdated_casks[@]}))
 total=$((num_f + num_c))
 
 # ---- 显示可更新列表 ----
@@ -1113,14 +1315,16 @@ if (( num_c > 0 )); then
 fi
 
 if (( num_ignored > 0 )); then
-  if (( total > 0 )); then
-    _draw_mid_border
-  fi
-  _line_left "${C_WARN}🚫 已屏蔽的 cask（${num_ignored} 个有更新）${C_RESET}"
+  if (( total > 0 )); then _draw_mid_border; fi
+  _line_left "${C_WARN}🚫 已屏蔽的包（${num_ignored} 个有更新）${C_RESET}"
   local ignored_idx=0
+  for f in "${ignored_outdated_formulae[@]}"; do
+    ((ignored_idx++))
+    _line_left "     ${C_MUTED}${ignored_idx}. formula ${C_WARN}${f}${C_RESET}  ${C_MUTED}（brew ua uig --formula ${f} 解除）${C_RESET}"
+  done
   for c in "${ignored_outdated_casks[@]}"; do
     ((ignored_idx++))
-    _line_left "     ${C_MUTED}${ignored_idx}. ${C_WARN}${c}${C_RESET}  ${C_MUTED}（brew ua unignore ${c} 解除）${C_RESET}"
+    _line_left "     ${C_MUTED}${ignored_idx}. cask ${C_WARN}${c}${C_RESET}  ${C_MUTED}（brew ua uig ${c} 解除）${C_RESET}"
   done
 fi
 
@@ -1137,9 +1341,9 @@ if [[ $use_greedy -eq 1 ]]; then
   echo "${C_MUTED}  💡 已启用 -a，包含自带自动更新的应用（Chrome / VS Code 等）${C_RESET}"
 fi
 if (( num_ignored > 0 )); then
-  echo "${C_WARN}  ⚠ 有 ${num_ignored} 个 cask 被屏蔽，不会被升级${C_RESET}"
+  echo "${C_WARN}  ⚠ 有 ${num_ignored} 个被屏蔽的包，不会被升级${C_RESET}"
   echo "${C_MUTED}     查看屏蔽列表: brew ua ignored${C_RESET}"
-  echo "${C_MUTED}     解除屏蔽: brew ua unignore <cask-name>${C_RESET}"
+  echo "${C_MUTED}     解除 cask: brew ua uig <name>；解除 formula: brew ua uig --formula <name>${C_RESET}"
 fi
 if (( self_update_available == 1 )); then
   echo "${C_WARN}  🎉 brew-update-all 有新版本，升级完成后请执行: ${C_BOLD}brew upgrade brew-update-all${C_RESET}"
@@ -1159,7 +1363,12 @@ else
     echo "${C_MUTED}  回车=全部，支持空格分隔（1 3 5）或范围（2-7）${C_RESET}"
     echo "${C_MUTED}  屏蔽 cask: 序号+i（如 5i 表示屏蔽第5个 cask）${C_RESET}"
     echo -n "  ${C_BOLD}输入序号:${C_RESET} "
-    read input
+    input=""
+    if ! read -r input; then
+      echo ""
+      echo "${C_WARN}  ⚠ 输入已关闭，已取消升级${C_RESET}"
+      exit 130
+    fi
 
     selected=()
     casks_to_ignore=()
@@ -1192,9 +1401,15 @@ else
 
     if (( ${#casks_to_ignore} > 0 )); then
       for c in "${casks_to_ignore[@]}"; do
-        _add_ignored_cask "$c"
-        echo ""
-        echo "${C_SUCCESS}  ✓ 已屏蔽 cask: ${C_BOLD}${c}${C_RESET}"
+        _add_ignored "cask" "$c"
+        ignore_rc=$?
+        if (( ignore_rc == 0 )); then
+          echo ""
+          echo "${C_SUCCESS}  ✓ 已屏蔽 cask: ${C_BOLD}${c}${C_RESET}"
+        elif (( ignore_rc > 1 )); then
+          echo "${C_ERROR}  ✗ 无法写入屏蔽列表：${IGNORED_FILE}${C_RESET}" >&2
+          exit 1
+        fi
       done
       echo "${C_MUTED}  解除屏蔽: brew ua unignore <cask-name>${C_RESET}"
       # 从 casks 剔除被屏蔽项并更新计数，循环重新选择
@@ -1270,14 +1485,14 @@ echo -n ""
 success_count=0
 fail_count=0
 failed_names=()
+failed_types=()
+failed_log_files=()
 success_names=()
 pkg_times=()
 current_idx=0
 completed_size=0
 
 _hide_cursor
-trap '_show_cursor' EXIT
-trap '_cleanup_and_exit' INT TERM
 
 _line_left "  ${C_MUTED}阶段 1/2：逐个下载更新包...${C_RESET}"
 _progress_bar 0 0 0 "$num_selected"
@@ -1288,6 +1503,8 @@ dl_ok_names=()
 dl_ok_types=()
 dl_ok_sizes=()
 dl_fail_names=()
+dl_fail_types=()
+dl_fail_logs=()
 dl_fail_reasons=()
 current_idx=0
 dl_done=0
@@ -1341,6 +1558,8 @@ for (( idx=1; idx<=num_selected; idx++ )); do
     _sub_progress_bar "$pkg_size" "$pkg_size" "已下载" 0
   else
     dl_fail_names+=("$name")
+    dl_fail_types+=("$type")
+    dl_fail_logs+=("$(_log_file_for "$type" "$name")")
     if (( fetch_rc == 2 )); then
       dl_fail_reasons+=("下载超时")
     else
@@ -1399,7 +1618,11 @@ for (( i=1; i<=install_total; i++ )); do
     size_display=" ${C_MUTED}· ?${C_RESET}"
   fi
 
-  local log_file="$TMP_BASE/$name.log"
+  local log_file
+  log_file=$(_log_file_for "$type" "$name") || {
+    echo "${C_ERROR}  ✗ 无法分配 ${type} ${name} 的日志文件${C_RESET}" >&2
+    exit 1
+  }
 
   _cursor_up 3
   _clr_line
@@ -1416,11 +1639,22 @@ for (( i=1; i<=install_total; i++ )); do
   pkg_start=$(date +%s)
   local brew_pid=""
   if [[ "$type" == "cask" ]]; then
-    brew reinstall --cask "$name" > "$log_file" 2>&1 &
+    python3 - "$name" > "$log_file" 2>&1 <<'PYEOF' &
+import os, sys
+os.setsid()
+os.execvp("brew", ["brew", "reinstall", "--cask", sys.argv[1]])
+PYEOF
   else
-    brew upgrade --formula "$name" > "$log_file" 2>&1 &
+    python3 - "$name" > "$log_file" 2>&1 <<'PYEOF' &
+import os, sys
+os.setsid()
+os.execvp("brew", ["brew", "upgrade", "--formula", sys.argv[1]])
+PYEOF
   fi
   brew_pid=$!
+  ACTIVE_PROCESS_PID="$brew_pid"
+  ACTIVE_PROCESS_PGID="$brew_pid"
+  ACTIVE_OPERATION="install"
 
   # 安装轮询（3 行界面）
   spin_idx=0
@@ -1460,6 +1694,9 @@ for (( i=1; i<=install_total; i++ )); do
 
   wait "$brew_pid"
   local brew_exit=$?
+  ACTIVE_PROCESS_PID=""
+  ACTIVE_PROCESS_PGID=""
+  ACTIVE_OPERATION=""
 
   pkg_end=$(date +%s)
   pkg_dur=$(( pkg_end - pkg_start ))
@@ -1469,7 +1706,7 @@ for (( i=1; i<=install_total; i++ )); do
   _clr_line
   if (( brew_exit == 0 )); then
     success_count=$(( success_count + 1 ))
-    success_names+=("$name")
+    success_names+=("$type: $name")
     completed_size=$(( completed_size + pkg_size ))
     (( completed_size > total_size )) && completed_size=$total_size
     install_done=$(( install_done + 1 ))
@@ -1477,6 +1714,8 @@ for (( i=1; i<=install_total; i++ )); do
   else
     fail_count=$(( fail_count + 1 ))
     failed_names+=("$name")
+    failed_types+=("$type")
+    failed_log_files+=("$log_file")
     completed_size=$(( completed_size + pkg_size ))
     (( completed_size > total_size )) && completed_size=$total_size
     install_done=$(( install_done + 1 ))
@@ -1492,42 +1731,74 @@ for (( i=1; i<=install_total; i++ )); do
   local next_pad=$(( $(_get_terminal_width) - 2 - ${#stripped_next} - 2 ))
   (( next_pad < 1 )) && next_pad=1
   echo "${C_BORDER}${B_V}${C_RESET} ${C_MUTED}${next_msg}${C_RESET}${C_BORDER}$(printf "%${next_pad}s" " ")${B_V}${C_RESET}"
+  if (( INTERRUPT_REQUESTED == 1 )); then
+    echo "${C_WARN}  ⚠ 当前安装已安全完成，不再启动后续包${C_RESET}"
+    exit 130
+  fi
 done
 
 # 下载失败/超时的包并入失败统计
 for (( f=1; f<=${#dl_fail_names[@]}; f++ )); do
   fail_count=$(( fail_count + 1 ))
   failed_names+=("${dl_fail_names[$f]}")
+  failed_types+=("${dl_fail_types[$f]}")
+  failed_log_files+=("${dl_fail_logs[$f]}")
   pkg_times+=("0")
 done
 
 _show_cursor
-trap - EXIT INT TERM
+if (( INTERRUPT_REQUESTED == 1 )); then
+  echo "${C_WARN}  ⚠ 已安全完成当前包，升级任务已取消${C_RESET}"
+  exit 130
+fi
 
 _draw_bottom_border
 
 # ---- cleanup ----
 echo ""
 _section_title "🧹" "清理旧版本"
-brew cleanup
-echo "${C_SUCCESS}  ✓ 清理完成${C_RESET}"
+cleanup_failed=0
+cleanup_log="$TMP_BASE/cleanup.log"
+if brew cleanup > "$cleanup_log" 2>&1; then
+  echo "${C_SUCCESS}  ✓ 清理完成${C_RESET}"
+else
+  cleanup_rc=$?
+  cleanup_failed=1
+  echo "${C_ERROR}  ✗ brew cleanup 失败（退出码 ${cleanup_rc}）${C_RESET}" >&2
+  cat "$cleanup_log" >&2
+  echo "${C_MUTED}  日志: ${cleanup_log}${C_RESET}" >&2
+fi
 
 if (( deep_prune == 1 )); then
   echo ""
   echo "${C_INFO}  ℹ 正在深度清理下载缓存...${C_RESET}"
-  brew cleanup --prune=all
-  echo "${C_SUCCESS}  ✓ 深度清理完成${C_RESET}"
+  prune_log="$TMP_BASE/prune.log"
+  if brew cleanup --prune=all > "$prune_log" 2>&1; then
+    echo "${C_SUCCESS}  ✓ 深度清理完成${C_RESET}"
+  else
+    prune_rc=$?
+    cleanup_failed=1
+    echo "${C_ERROR}  ✗ 深度清理失败（退出码 ${prune_rc}）${C_RESET}" >&2
+    cat "$prune_log" >&2
+    echo "${C_MUTED}  日志: ${prune_log}${C_RESET}" >&2
+  fi
 fi
 
 if (( clean_logs == 1 )); then
   echo ""
   echo "${C_INFO}  ℹ 清理本次产生的临时日志...${C_RESET}"
-  if [[ -d "$TMP_BASE" ]]; then
+  if (( TMP_BASE_CREATED == 1 )) && [[ -d "$TMP_BASE" && ! -L "$TMP_BASE" && "${TMP_BASE:h}" == "$TMP_ROOT" && "${TMP_BASE:t}" == brew-ua.* ]]; then
     local log_count=$(find "$TMP_BASE" -type f 2>/dev/null | wc -l | tr -d ' ')
-    rm -rf "$TMP_BASE"
-    echo "${C_SUCCESS}  ✓ 已清理临时日志目录（${log_count} 个文件）${C_RESET}"
+    if rm -rf "$TMP_BASE"; then
+      TMP_BASE_CREATED=0
+      echo "${C_SUCCESS}  ✓ 已清理本次临时日志目录（${log_count} 个文件）${C_RESET}"
+    else
+      cleanup_failed=1
+      echo "${C_ERROR}  ✗ 无法清理本次临时日志目录${C_RESET}" >&2
+    fi
   else
-    echo "${C_MUTED}  - 无临时日志${C_RESET}"
+    cleanup_failed=1
+    echo "${C_ERROR}  ✗ 临时日志目录校验失败，未执行清理${C_RESET}" >&2
   fi
 fi
 
@@ -1554,9 +1825,9 @@ _line_left "     ${C_MUTED}成功率:${C_RESET}  $(( num_selected > 0 ? success_
 if (( fail_count > 0 )); then
   _draw_mid_border
   _line_left "  ${C_ERROR}${C_BOLD}失败的包:${C_RESET}"
-  local fn
-  for fn in $failed_names; do
-    _line_left "     ${C_ERROR}• ${fn}${C_RESET}  ${C_MUTED}日志: ${TMP_BASE}/${fn}.log${C_RESET}"
+  local failed_idx
+  for (( failed_idx=1; failed_idx<=${#failed_names[@]}; failed_idx++ )); do
+    _line_left "     ${C_ERROR}• ${failed_types[$failed_idx]}: ${failed_names[$failed_idx]}${C_RESET}  ${C_MUTED}日志: ${failed_log_files[$failed_idx]}${C_RESET}"
   done
 fi
 
@@ -1565,7 +1836,7 @@ if (( success_count > 0 )); then
   _line_left "  ${C_SUCCESS}${C_BOLD}成功的包:${C_RESET}"
   local count=0
   local line=""
-  for sn in $success_names; do
+  for sn in "${success_names[@]}"; do
     if (( count == 0 )); then
       line="     ${C_SUCCESS}• ${sn}${C_RESET}"
       count=1
@@ -1598,6 +1869,11 @@ fi
 if (( fail_count > 0 )); then
   echo "${C_WARN}  ⚠  有 ${fail_count} 个包升级失败，可查看上方日志排查问题${C_RESET}"
   echo ""
+  exit 1
+fi
+
+if (( cleanup_failed > 0 )); then
+  echo "${C_ERROR}  ✗ 升级已完成，但有清理步骤失败；请检查上方日志${C_RESET}" >&2
   exit 1
 fi
 

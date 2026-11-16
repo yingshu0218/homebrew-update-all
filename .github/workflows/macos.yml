@@ -13,6 +13,11 @@ on:
       - 'brew-ua'
       - '.github/workflows/macos.yml'
   workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Commit to validate after CNB sync
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -23,6 +28,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha || github.sha }}
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate project
@@ -35,3 +42,7 @@ jobs:
           -destination 'platform=macOS'
           -derivedDataPath "$RUNNER_TEMP/BrewUA-DerivedData"
           CODE_SIGNING_ALLOWED=NO
+      - name: Check download sampling with Thread Sanitizer
+        run: bash BrewUA/scripts/verify-gui.sh tsan
+      - name: Typecheck offline render tool
+        run: bash BrewUA/scripts/verify-gui.sh render

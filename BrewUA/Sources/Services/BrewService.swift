@@ -18,12 +18,20 @@ protocol BrewServicing: AnyObject {
 /// 只有执行型命令才走流式输出。
 final class BrewService: BrewServicing {
     static let shared = BrewService()
-    private let config = ConfigService.shared
+    private let config: ConfigService
 
     private let query: (([String]) async throws -> String)?
+    private let processFactory: (([String]) -> StreamedProcess)?
 
-    init(query: (([String]) async throws -> String)? = nil) {
+    init(query: (([String]) async throws -> String)? = nil, config: ConfigService = .shared,
+         processFactory: (([String]) -> StreamedProcess)? = nil) {
         self.query = query
+        self.config = config
+        self.processFactory = processFactory
+    }
+
+    private func makeProcess(arguments: [String]) -> StreamedProcess {
+        processFactory?(arguments) ?? StreamedProcess(brewArguments: arguments)
     }
 
     enum QueryError: Error, LocalizedError {
@@ -43,9 +51,9 @@ final class BrewService: BrewServicing {
     private func runSerialized(_ arguments: [String]) async throws -> String {
         if let query { return try await query(arguments) }
         return try await withBrewGate {
-            let result = await StreamedProcess(brewArguments: arguments).runSyncChecked(timeout: 30)
+            let result = await makeProcess(arguments: arguments).runSyncChecked(timeout: 30)
             guard result.success else { throw QueryError.commandFailed(result.output) }
-            return result.output
+            return result.stdout
         }
     }
 
@@ -53,17 +61,18 @@ final class BrewService: BrewServicing {
     /// 供 EnvDetector 等绕开 BrewService 内部方法的调用方统一走闸门。
     func brewOutput(_ arguments: [String], timeout: TimeInterval = 30) async -> String? {
         try? await withBrewGate {
-            let result = await StreamedProcess(brewArguments: arguments).runSyncChecked(timeout: timeout)
+            let result = await makeProcess(arguments: arguments).runSyncChecked(timeout: timeout)
             guard result.success else { throw QueryError.commandFailed(result.output) }
-            return result.output
+            return result.stdout
         }
     }
 
     /// 同步执行 brew 命令,返回 (输出, 是否成功退出)。失败给出明确状态而非静默。
     func brewChecked(_ arguments: [String], timeout: TimeInterval = 120) async -> (output: String, success: Bool) {
-        (try? await withBrewGate {
-            await StreamedProcess(brewArguments: arguments).runSyncChecked(timeout: timeout)
-        }) ?? ("", false)
+        guard let result = try? await withBrewGate({
+            await makeProcess(arguments: arguments).runSyncChecked(timeout: timeout)
+        }) else { return ("", false) }
+        return (result.output, result.success)
     }
 
     // MARK: - brew update
@@ -75,9 +84,17 @@ final class BrewService: BrewServicing {
     @MainActor
     func update(onLine: @escaping (String) -> Void) async throws {
         try await withBrewGate {
-            let proc = StreamedProcess(brewArguments: ["update"])
-            for try await event in proc.run() {
-                onLine(event.text)
+            let proc = makeProcess(arguments: ["update"])
+            do {
+                for try await event in proc.run(timeout: Constants.brewUpdateTimeout) {
+                    onLine(event.text)
+                }
+                try Task.checkCancellation()
+                await proc.waitUntilTerminated()
+            } catch {
+                // 取消/超时必须回收本次会话组和管道持有者，再由 withBrewGate 释放锁。
+                await proc.terminateAndWait()
+                throw error
             }
         }
     }
@@ -109,7 +126,7 @@ final class BrewService: BrewServicing {
         return (formulae + casks)
             .map { entry in
                 var e = entry
-                e.isIgnored = ignored.contains(entry.name)
+                e.isIgnored = ConfigService.isIgnored(name: entry.name, kind: entry.kind, rules: ignored)
                 return e
             }
             .sorted { $0.kind.rawValue != $1.kind.rawValue ? $0.kind == .formula : $0.name < $1.name }
@@ -157,18 +174,22 @@ final class BrewService: BrewServicing {
 
     /// 从 `brew info --json=v2` 输出里提取首个下载 URL(回退解析)。
     /// 单独抽成静态方法便于单测。
-    nonisolated static func extractDownloadURL(fromInfoJSON json: String) -> String? {
+    nonisolated static func extractDownloadURL(fromInfoJSON json: String,
+                                               platform: String? = currentBottlePlatform(),
+                                               cacheFileURL: URL? = nil) -> String? {
         struct InfoPayload: Decodable {
             struct Formula: Decodable {
-                let urls: [String]?
-                let url: String?
+                struct URLValue: Decodable { let url: String? }
+                struct URLs: Decodable { let stable: URLValue? }
+                struct Bottle: Decodable {
+                    struct Stable: Decodable { let files: [String: URLValue]? }
+                    let stable: Stable?
+                }
+                let urls: URLs?
+                let bottle: Bottle?
             }
             struct Cask: Decodable {
                 let url: String?
-                let artifacts: [CaskArtifact]?
-                struct CaskArtifact: Decodable {
-                    let url: String?
-                }
             }
             let formulae: [Formula]
             let casks: [Cask]
@@ -176,16 +197,66 @@ final class BrewService: BrewServicing {
         guard let data = json.data(using: .utf8),
               let payload = try? JSONDecoder().decode(InfoPayload.self, from: data) else { return nil }
         if let f = payload.formulae.first {
-            if let urls = f.urls, !urls.isEmpty { return urls.first }
-            if let u = f.url { return u }
+            let bottleFiles = f.bottle?.stable?.files ?? [:]
+            if let cacheFileURL, let selectedTag = bottleTag(inCachePath: cacheFileURL.path) {
+                // brew --cache 返回的默认目标确定了 Homebrew 实际选择的 bottle tag，
+                // 包括较新 macOS 回退到较旧兼容 bottle 的情况。
+                return bottleFiles[selectedTag]?.url
+            }
+            if let cacheFileURL, cacheFileURL.lastPathComponent.contains(".bottle") {
+                // 确认 Homebrew 选了 bottle，但无法辨认其 tag 时，不用源码大小误导进度。
+                return nil
+            }
+            if cacheFileURL != nil {
+                // `brew --cache` 的目标是源码缓存文件时，直接对应 stable 源码 URL。
+                return f.urls?.stable?.url
+            }
+            if let platform, let bottleURL = bottleFiles[platform]?.url {
+                return bottleURL
+            }
+            if let bottleURL = bottleFiles["all"]?.url { return bottleURL }
+            // 没有可用 bottle 信息时不猜测实际下载源，进度总量保持未知。
+            if !bottleFiles.isEmpty { return nil }
+            return f.urls?.stable?.url
         }
         if let c = payload.casks.first {
-            if let u = c.url { return u }
-            if let artifacts = c.artifacts {
-                for a in artifacts where a.url != nil { return a.url }
-            }
+            return c.url
         }
         return nil
+    }
+
+    nonisolated static func bottleTag(inCachePath path: String) -> String? {
+        let filename = URL(fileURLWithPath: path).lastPathComponent
+        guard let range = filename.range(of: #"\.([A-Za-z0-9_]+)\.bottle(?:\.\d+)?\.tar\.gz$"#,
+                                         options: .regularExpression) else { return nil }
+        let suffix = String(filename[range])
+        return suffix.dropFirst().components(separatedBy: ".bottle").first
+    }
+
+    nonisolated static func currentBottlePlatform() -> String? {
+        #if arch(arm64)
+        let architecture = "arm64"
+        #elseif arch(x86_64)
+        let architecture = "x86_64"
+        #else
+        return nil
+        #endif
+        return bottlePlatform(architecture: architecture,
+                              macOSMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion)
+    }
+
+    nonisolated static func bottlePlatform(architecture: String, macOSMajorVersion major: Int) -> String? {
+        let codename: String
+        switch major {
+        case 26: codename = "tahoe"
+        case 15: codename = "sequoia"
+        case 14: codename = "sonoma"
+        case 13: codename = "ventura"
+        case 12: codename = "monterey"
+        case 11: codename = "big_sur"
+        default: return nil
+        }
+        return architecture == "arm64" ? "arm64_\(codename)" : codename
     }
 
     /// HEAD 请求下载地址,拿 `Content-Length`(字节)作为包总大小。失败返回 nil(调用侧降级)。
@@ -250,18 +321,22 @@ final class BrewService: BrewServicing {
     @MainActor
     func fetch(package: OutdatedEntry, onLine: @escaping (String) -> Void, onProgress: @escaping (Int64, Int64, Double) -> Void) async throws {
         let flag = package.kind == .formula ? "--formula" : "--cask"
+        let cacheURL = await cacheFileURL(package: package)
         // ① 先探测包大小:info 查询过闸门 + HEAD 网络请求(不占闸门)。
         //    必须在下载主体前完成——闸门内不能再调 runSerialized(actor 不可重入,会死锁)
         var total: Int64 = 0
         if let json = try? await runSerialized(["info", "--json=v2", flag, package.name]),
-           let url = Self.extractDownloadURL(fromInfoJSON: json) {
+           let url = Self.extractDownloadURL(fromInfoJSON: json, cacheFileURL: cacheURL) {
             total = await Self.probeDownloadSize(urlString: url) ?? 0
         }
         // ② 下载主体:整个下载期间持有闸门(期间其他 brew 命令排队等待)
         try await withBrewGate {
-            let proc = StreamedProcess(brewArguments: ["fetch", flag, package.name])
+            var arguments = ["fetch", flag]
+            if package.kind == .formula { arguments.append("--deps") }
+            arguments.append(package.name)
+            let proc = makeProcess(arguments: arguments)
             // 独立定时器轮询缓存文件大小算速度(不依赖 brew 输出事件频率)
-            let poll = PollingMonitor(packageName: package.name, kind: package.kind, interval: Constants.downloadPollInterval) { bytes, speed in
+            let poll = PollingMonitor(fileURL: cacheURL, interval: Constants.downloadPollInterval) { bytes, speed in
                 onProgress(bytes, total, speed)
             }
             poll.start()
@@ -276,15 +351,18 @@ final class BrewService: BrewServicing {
                         reportedOnce = true
                     }
                 }
+                try Task.checkCancellation()
+                await proc.waitUntilTerminated()
             } catch {
                 poll.stop()
+                await proc.terminateAndWait()
                 let finalBytes = reportedOnce ? lastBytes : 0
                 onProgress(finalBytes, total, 0)
                 throw error
             }
             poll.stop()
             // 结束时:上报当前缓存大小(下载完成后 .incomplete 改名为正式文件,最后一次采样已覆盖)
-            if let finalSize = BrewService.currentDownloadFileSize(packageName: package.name) {
+            if let finalSize = BrewService.currentDownloadFileSize(cacheFileURL: cacheURL) {
                 onProgress(finalSize, total, 0)
             } else if reportedOnce {
                 onProgress(lastBytes, total, 0)
@@ -295,6 +373,15 @@ final class BrewService: BrewServicing {
         }
     }
 
+    private func cacheFileURL(package: OutdatedEntry) async -> URL? {
+        let flag = package.kind == .formula ? "--formula" : "--cask"
+        guard let output = try? await runSerialized(["--cache", flag, package.name]) else { return nil }
+        let path = output.split(whereSeparator: \.isNewline).last.map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !path.isEmpty else { return nil }
+        return URL(fileURLWithPath: path)
+    }
+
     /// 阶段2:安装单个包。formula 走 upgrade,cask 走 reinstall(复刻 brew-ua 分支)
     /// @MainActor:同理,onLine 在主线程执行
     @MainActor
@@ -303,9 +390,16 @@ final class BrewService: BrewServicing {
             let args: [String] = package.kind == .formula
                 ? ["upgrade", "--formula", package.name]
                 : ["reinstall", "--cask", package.name]
-            let proc = StreamedProcess(brewArguments: args)
-            for try await event in proc.run() {
-                onLine(event.text)
+            let proc = makeProcess(arguments: args)
+            do {
+                for try await event in proc.run() {
+                    onLine(event.text)
+                }
+                try Task.checkCancellation()
+                await proc.waitUntilTerminated()
+            } catch {
+                await proc.terminateAndWait()
+                throw error
             }
         }
     }
@@ -356,8 +450,8 @@ final class BrewService: BrewServicing {
         }
         let formulae = packages.filter { $0.kind == .formula }.count
         let casks = packages.filter { $0.kind == .cask }.count
-        let outdatedFormulae = outdatedF.filter { !ignored.contains($0.name) }.count
-        let outdatedCasks = outdatedC.filter { !ignored.contains($0.name) }.count
+        let outdatedFormulae = outdatedF.filter { !ConfigService.isIgnored(name: $0.name, kind: .formula, rules: ignored) }.count
+        let outdatedCasks = outdatedC.filter { !ConfigService.isIgnored(name: $0.name, kind: .cask, rules: ignored) }.count
         return (formulae, casks, outdatedFormulae, outdatedCasks, outdatedReliable, installed.success)
     }
 
@@ -485,6 +579,19 @@ final class BrewService: BrewServicing {
         return sorted.first?.1
     }
 
+    /// Reads only the exact target reported by `brew --cache` and its in-progress suffix.
+    nonisolated static func currentDownloadFileSize(cacheFileURL: URL?) -> Int64? {
+        guard let cacheFileURL else { return nil }
+        let incomplete = URL(fileURLWithPath: cacheFileURL.path + ".incomplete")
+        for candidate in [incomplete, cacheFileURL] {
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: candidate.path),
+                  let size = (attributes[.size] as? NSNumber)?.int64Value,
+                  size >= 0 else { continue }
+            return size
+        }
+        return nil
+    }
+
     /// brew 下载缓存目录:$HOME/Library/Caches/Homebrew/downloads
     nonisolated static func brewDownloadsDirectory() -> URL? {
         let dir = URL(fileURLWithPath: NSHomeDirectory())
@@ -506,6 +613,7 @@ final class PollingMonitor {
     private var lastTime: Date = Date()
     private var hasBaseline = false
     private let queue = DispatchQueue(label: "brewua.download-monitor")
+    private let stateLock = NSLock()
 
     /// - Parameters:
     ///   - sample: 返回当前已下载字节(需线程安全)
@@ -525,16 +633,28 @@ final class PollingMonitor {
                   onSample: onSample)
     }
 
+    convenience init(fileURL: URL?, interval: TimeInterval = 0.6,
+                     onSample: @escaping (Int64, Double) -> Void) {
+        self.init(sample: { BrewService.currentDownloadFileSize(cacheFileURL: fileURL) },
+                  interval: interval,
+                  onSample: onSample)
+    }
+
     /// 采样一次(由外部循环或定时器调用,返回当前大小)并报告速度。
     /// 若采样失败返回 nil(文件未出现或已改名)。
     func sample() -> Int64? {
-        guard let size = monitor() else { return nil }
+        stateLock.lock()
+        guard let size = monitor() else {
+            stateLock.unlock()
+            return nil
+        }
         let now = Date()
+        var reportValue: (Int64, Double)?
         if hasBaseline {
             let dt = now.timeIntervalSince(lastTime)
             if dt >= 0.2 {
                 let speed = max(0, Double(size - lastSize) / dt)
-                report(size, speed)
+                reportValue = (size, speed)
                 lastSize = size
                 lastTime = now
             }
@@ -542,8 +662,10 @@ final class PollingMonitor {
             hasBaseline = true
             lastSize = size
             lastTime = now
-            report(size, 0)
+            reportValue = (size, 0)
         }
+        stateLock.unlock()
+        if let reportValue { report(reportValue.0, reportValue.1) }
         return size
     }
 
@@ -553,14 +675,16 @@ final class PollingMonitor {
         if Thread.isMainThread {
             onSample(size, speed)
         } else {
-            DispatchQueue.main.async { [weak self] in
-                self?.onSample(size, speed)
+            DispatchQueue.main.async { [onSample] in
+                onSample(size, speed)
             }
         }
     }
 
     /// 启动独立定时轮询(下载期间自动持续上报速度,不依赖 brew 输出)。
     func start() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         guard timer == nil else { return }
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + interval, repeating: interval)
@@ -572,6 +696,8 @@ final class PollingMonitor {
     }
 
     func stop() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         timer?.cancel()
         timer = nil
     }

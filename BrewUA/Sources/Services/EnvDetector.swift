@@ -21,6 +21,7 @@ struct EnvironmentInfo {
     var brewVersion: String
     var prefix: String
     var mirrorSource: MirrorSource
+    var shellConfiguredMirrorSource: MirrorSource
     var tapRemotes: [String: String]     // tap 名 -> 远程 URL
     var networkCountry: String
     var isNetworkOk: Bool
@@ -53,21 +54,21 @@ enum EnvDetector {
             netOK = true
         }
 
-        // 镜像源检测:多来源汇总(见 inferMirror)。GUI 由 LaunchServices 启动不继承 shell
-        // export,所以除进程环境变量外,还需读用户 shell 配置里的 HOMEBREW_*。
-        let envText = ProcessInfo.processInfo.environment
+        // 有效源只基于 GUI 实际传给 brew 的环境及 `brew config`。
+        // shell 文件只做静态展示，不执行用户 shell 内容，也不假装会影响本次 brew。
+        let envText = StreamedProcess.brewEnv
             .filter { $0.key.hasPrefix("HOMEBREW_") }
-            .values
+            .map { "\($0.key)=\($0.value)" }
             .joined(separator: " ")
         let shellText = readShellBrewEnv()
         let brewConfigText = await BrewService.shared.brewOutput(["config"]) ?? ""
-        let mergedMirrorText = envText + " " + shellText + " " + brewConfigText + " " + tapRemotes.values.joined(separator: " ")
 
         return EnvironmentInfo(
             brewPath: path,
             brewVersion: version,
             prefix: prefix,
-            mirrorSource: inferMirror(fromText: mergedMirrorText),
+            mirrorSource: inferMirror(fromText: envText + " " + brewConfigText),
+            shellConfiguredMirrorSource: inferMirror(fromText: shellText),
             tapRemotes: tapRemotes,
             networkCountry: country,
             isNetworkOk: netOK

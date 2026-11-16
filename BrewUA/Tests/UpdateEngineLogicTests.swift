@@ -10,7 +10,7 @@ final class UpdateEngineLogicTests: XCTestCase {
             makeEntry("firefox"),
             makeEntry("mysql")
         ]
-        let result = filterOutIgnored(entries, ignored: ["firefox"])
+        let result = filterOutIgnored(entries, ignored: ["formula:firefox"])
         XCTAssertEqual(result.map(\.name), ["wget", "mysql"])
     }
 
@@ -23,13 +23,22 @@ final class UpdateEngineLogicTests: XCTestCase {
     /// 全屏蔽 → 空清单
     func testFilterOutIgnoredAllIgnored() {
         let entries = [makeEntry("wget")]
-        XCTAssertTrue(filterOutIgnored(entries, ignored: ["wget"]).isEmpty)
+        XCTAssertTrue(filterOutIgnored(entries, ignored: ["formula:wget"]).isEmpty)
+    }
+
+    func testLegacyBareIgnoredRuleOnlyFiltersCasks() {
+        let entries = [
+            makeEntry("same", kind: .formula),
+            makeEntry("same", kind: .cask)
+        ]
+        let remaining = filterOutIgnored(entries, ignored: ["same"])
+        XCTAssertEqual(remaining.map(\.identity), [PackageIdentity(kind: .formula, name: "same")])
     }
 
     /// upgrade(packages:) 空包列表是安全的(直接忽略,不启动)
     @MainActor
     func testUpgradeEmptyPackagesIsNoop() {
-        let engine = UpdateEngine()
+        let engine = makeEngine()
         engine.upgrade(packages: [])
         XCTAssertFalse(engine.isRunning)
         XCTAssertTrue(engine.tasks.isEmpty)
@@ -38,11 +47,22 @@ final class UpdateEngineLogicTests: XCTestCase {
     /// 关联测试:disabled 逻辑 —— 无待更新时"更新所选"按钮不可用(在视图层,这里验证 guard)
     @MainActor
     func testPendingUpdatesDefaultEmpty() {
-        let engine = UpdateEngine()
+        let engine = makeEngine()
         XCTAssertTrue(engine.pendingUpdates.isEmpty)
     }
 
     private func makeEntry(_ name: String) -> OutdatedEntry {
         OutdatedEntry(name: name, currentVersion: "1.0", newestVersion: "2.0", kind: .formula, isIgnored: false)
+    }
+
+    private func makeEntry(_ name: String, kind: PackageKind) -> OutdatedEntry {
+        OutdatedEntry(name: name, currentVersion: "1.0", newestVersion: "2.0", kind: kind, isIgnored: false)
+    }
+
+    @MainActor
+    private func makeEngine() -> UpdateEngine {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("brewua-logic-\(UUID().uuidString)/ignored_casks")
+        addTeardownBlock { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
+        return UpdateEngine(config: ConfigService(fileURL: file))
     }
 }

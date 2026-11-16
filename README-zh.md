@@ -58,6 +58,10 @@ brew ua ck
 brew ua ig firefox
 brew ua uig firefox
 brew ua igl
+
+# 屏蔽/解除屏蔽 formula（不带 --formula 时仍默认操作 cask）
+brew ua ig --formula wget
+brew ua uig --formula wget
 ```
 
 | 模式 / 选项 | 说明 |
@@ -70,9 +74,13 @@ brew ua igl
 | `--prune` | 升级后深度清理下载缓存（`brew cleanup --prune=all`） |
 | `--clean-logs` | 升级后清理本次产生的临时日志文件 |
 | `ck` / `check` | 环境诊断：网络、Tap 源、本地配置检测 |
-| `ig` / `ignore <cask>` | 屏蔽指定 cask，不再出现在更新列表 |
-| `uig` / `unignore <cask>` | 解除屏蔽 |
-| `igl` / `ignored` | 查看当前屏蔽列表 |
+| `ig` / `ignore <name>` | 屏蔽指定 cask（默认），不再出现在更新列表 |
+| `ig --formula <name>` | 屏蔽指定 formula |
+| `uig` / `unignore <name>` | 解除 cask 屏蔽（默认） |
+| `uig --formula <name>` | 解除 formula 屏蔽 |
+| `igl` / `ignored` | 查看当前 formula 和 cask 屏蔽列表 |
+
+屏蔽配置仍保存在 `~/.config/brew-ua/ignored_casks`：旧的裸名称行和新写入的 cask 行都表示 cask；formula 行使用 `formula:<name>`。配置名称含 `/` 时按完整 tap 名匹配；短名称按同类型包名的末段匹配。
 
 > **提示**：不加 `-a` 时，Homebrew 默认跳过 `auto_updates true` 的应用，因为它们会自己后台更新。如果你希望精确控制所有包的版本，加上 `-a`。
 
@@ -83,7 +91,7 @@ brew ua igl
 - ⏱️ **耗时统计** – 每个包的升级耗时和总耗时
 - 📋 **统计摘要** – 升级完成后展示成功/失败数量和详细列表
 - 🎯 **分类升级** – 支持只升级 formula 或只升级 cask
-- 🚫 **屏蔽列表** – 可屏蔽指定 cask，升级时自动跳过
+- 🚫 **屏蔽列表** – 可分别屏蔽指定 formula 和 cask，升级时自动跳过
 - 🔍 **日志记录** – 失败的包自动保存日志到独立临时目录（`/tmp/brew-ua.XXXXXX`）
 - 📦 **包大小显示** – 下载后自动解析并显示每个包的大小
 - ⚡ **下载速度** – formula 与 cask 下载时均实时显示进度与 MB/s 速度
@@ -94,8 +102,8 @@ brew ua igl
 
 1. **brew update** – 更新源和包信息
 2. **列出可更新包** – formula 和 cask 分类展示在带边框的面板中
-3. **阶段 1：逐个下载** – 每个包独立下载，带进度条、实时速度、单包超时（默认 10 分钟）与失败隔离；下载卡住会被终止并跳过，不影响其他包
-4. **阶段 2：逐个安装** – 只安装下载成功的包（cask 用 `brew reinstall`，formula 用 `brew upgrade`，命中缓存不重复下载）
+3. **阶段 1：逐个下载** – 每个包独立下载，带进度条、实时速度、单包超时（默认 10 分钟）与失败隔离；formula fetch 会预取依赖（`--deps`），cask 使用受支持的参数。取消或超时会终止并回收下载进程组
+4. **阶段 2：逐个安装** – 只安装下载成功的包（cask 用 `brew reinstall`，formula 用 `brew upgrade`，命中缓存不重复下载）。取消时会等待当前包安全安装完成，再停止后续队列；源码构建和 cask 安装器仍可能在安装阶段访问网络
 5. **brew cleanup** – 清理旧版本
 6. **统计摘要** – 展示总耗时、成功率、成功/失败包列表
 
@@ -136,6 +144,12 @@ brew ua igl
 brew uninstall brew-update-all
 brew untap yingshu0218/update-all
 ```
+
+## CI 与同步
+
+- **CNB**（`.cnb.yml`）每次推送都会运行 zsh 语法、冒烟、CLI 边界和锁测试；这些回归用例使用假 brew、临时目录，不访问网络。
+- **GitHub Actions** 运行 CLI/Formula 检查和 macOS 应用构建/XCTest。
+- **CNB 同步**：GitHub 每天北京时间 09:17 检查 CNB 开发仓库。同步成功后会显式调度 CLI 与 macOS 验证，并对新同步的最高有效 `v*` 标签调度 Formula 更新；验证使用 GitHub 当前 `main` 的 SHA，Formula 更新从当前 `main` 前进且会拒绝版本降级，不依赖 `GITHUB_TOKEN` 递归触发 push 工作流。
 
 ## 许可证
 

@@ -2,7 +2,7 @@ name: Sync from CNB
 # CNB(开发仓库)→ GitHub(主仓库)全分支自动同步
 # CNB 是开发主战场,此 workflow 定时把 CNB 的全部分支/标签镜像到 GitHub 兜底;
 # 本地开发时也可 git push origin 直推 GitHub(秒级)。
-# 零凭据:brewua 为公开仓库拉取无需 token;push 使用仓库内置 GITHUB_TOKEN。
+# 零凭据:brewua 为公开仓库拉取无需 token;push 与后续显式 workflow_dispatch 使用仓库内置 GITHUB_TOKEN。
 
 on:
   schedule:
@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: sync-from-cnb
@@ -20,6 +21,10 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
       - name: 检查 CNB 分支与标签是否有变化
         id: check
         env:
@@ -36,13 +41,16 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 拉取 CNB 仓库并推送全部分支
+      - name: 拉取 CNB 仓库、快进同步并显式调度验证
         if: steps.check.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG_SELECTOR: ${{ github.workspace }}/scripts/release-tags.py
         run: |
           set -euo pipefail
           git clone --bare https://cnb.cool/blueteam0715/brewua.git cnb-mirror
           cd cnb-mirror
-          git remote add github "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git remote add github "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git fetch --no-tags github '+refs/heads/*:refs/remotes/github/*'
           # GitHub 可能有独立提交（如 LICENSE、Formula 自动更新）。只做快进，绝不覆盖。
           while IFS= read -r ref; do
@@ -60,9 +68,47 @@ jobs:
             fi
           done < <(git for-each-ref --format='%(refname)' refs/heads/)
           # 只推送新增或变化的标签；同名标签冲突仍由 Git 拒绝。
+          new_version_tags=()
           while read -r sha ref; do
             if ! grep -Fqx "${sha}"$'\t'"${ref}" ../github-refs; then
               git push github "$ref:$ref"
+              tag_name="${ref#refs/tags/}"
+              if [[ "$tag_name" == v* ]]; then new_version_tags+=("$tag_name"); fi
             fi
           done < <(git for-each-ref --format='%(objectname) %(refname)' refs/tags/)
-          echo "✓ CNB → GitHub 同步完成"
+          # GITHUB_TOKEN pushes do not trigger push workflows. Read the actual
+          # GitHub main SHA after sync, then dispatch validation and Formula work.
+          target_sha="$(git ls-remote github refs/heads/main | awk 'NR == 1 {print $1}')"
+          if [[ ! "$target_sha" =~ ^[0-9a-f]{40,64}$ ]]; then
+            echo "::error::Unable to read the synchronized GitHub main SHA"
+            exit 1
+          fi
+          new_tags_input=""
+          if ((${#new_version_tags[@]} > 0)); then
+            new_tags_input="$(printf '%s\n' "${new_version_tags[@]}")"
+          fi
+          latest_version_tag="$(printf '%s\n' "$new_tags_input" | python3 "$RELEASE_TAG_SELECTOR" select)"
+          echo "GitHub main target: ${target_sha}"
+          dispatch_workflow() {
+            local workflow="$1" payload="$2"
+            curl --fail --silent --show-error --retry 5 --retry-delay 2 --retry-all-errors \
+              -X POST \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/${workflow}/dispatches" \
+              -d "$payload"
+          }
+          main_payload="{\"ref\":\"main\",\"inputs\":{\"target_sha\":\"${target_sha}\"}}"
+          dispatch_workflow test.yml "$main_payload"
+          echo "已调度 CLI 验证：${target_sha}"
+          dispatch_workflow macos.yml "$main_payload"
+          echo "已调度 macOS 构建与 XCTest：${target_sha}"
+          if [[ -n "$latest_version_tag" ]]; then
+            tag_payload="{\"ref\":\"main\",\"inputs\":{\"tag_name\":\"${latest_version_tag}\"}}"
+            dispatch_workflow bump-formula-on-tag.yml "$tag_payload"
+            echo "已调度最高有效版本的 Formula 更新：${latest_version_tag}"
+          else
+            echo "本次没有新增有效 v* 版本标签，无需调度 Formula 更新"
+          fi
+          echo "✓ CNB → GitHub 同步完成并已显式调度验证"

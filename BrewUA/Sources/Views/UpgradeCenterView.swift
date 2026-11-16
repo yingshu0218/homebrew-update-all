@@ -5,8 +5,8 @@ import SwiftUI
 struct UpgradeCenterView: View {
     @EnvironmentObject private var engine: UpdateEngine
 
-    /// 勾选状态:包名 → 是否选中
-    @State private var selectedNames: Set<String> = []
+    /// 勾选状态使用 kind + name，允许同名 formula 与 cask 独立选择。
+    @State private var selectedPackageIDs: Set<PackageIdentity> = []
     @State private var greedy = false
     /// 更新记录面板
     @State private var showHistory = false
@@ -20,6 +20,9 @@ struct UpgradeCenterView: View {
                 taskListView
                 if let s = engine.summary {
                     summaryView(s)
+                }
+                if !engine.isRunning && !engine.pendingUpdates.isEmpty {
+                    pendingSummaryView
                 }
                 logSection
             } else if !engine.pendingUpdates.isEmpty {
@@ -40,9 +43,9 @@ struct UpgradeCenterView: View {
         .sheet(isPresented: $showHistory) {
             HistorySheet()
         }
-        .onChange(of: engine.pendingUpdates.count) { _, _ in
+        .onChange(of: engine.pendingUpdates.map(\.id)) { _, ids in
             // 清单刷新时重置勾选(避免残留旧勾选)
-            selectedNames = Set(engine.pendingUpdates.map(\.name))
+            selectedPackageIDs = Set(engine.pendingUpdates.map(\.identity))
         }
     }
 
@@ -65,52 +68,37 @@ struct UpgradeCenterView: View {
                 Button("取消") {
                     engine.cancel()
                 }
-            } else if engine.pendingUpdates.isEmpty && engine.tasks.isEmpty {
-                // 尚未检测 / 已清空
-                Toggle("包含自更新应用", isOn: $greedy)
-                    .toggleStyle(.checkbox)
-                    .font(.caption)
-                historyButton
-                Button {
-                    engine.checkOnly(options: UpdateOptions(greedy: greedy))
-                } label: {
-                    Label("检查更新", systemImage: "magnifyingglass")
-                }
-            } else if !engine.pendingUpdates.isEmpty {
-                // 有清单但未运行 → 可再次检查、清空
-                Toggle("包含自更新应用", isOn: $greedy)
-                    .toggleStyle(.checkbox)
-                    .font(.caption)
-                historyButton
-                Button {
-                    engine.checkOnly(options: UpdateOptions(greedy: greedy))
-                } label: {
-                    Label("检查更新", systemImage: "magnifyingglass")
-                }
-                Button(role: .destructive) {
-                    engine.reset()
-                } label: {
-                    Label("清空", systemImage: "trash")
-                }
             } else {
-                // 运行结束:重试失败 + 再次检查 + 清空
-                if engine.failedCount > 0 {
+                Toggle("包含自更新应用", isOn: $greedy)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+                historyButton
+                Button {
+                    engine.checkOnly(options: UpdateOptions(greedy: greedy))
+                } label: {
+                    Label(engine.tasks.isEmpty && engine.pendingUpdates.isEmpty ? "检查更新" : "再次检查",
+                          systemImage: "magnifyingglass")
+                }
+                if engine.retryableCount > 0 {
                     Button {
                         engine.retryFailed()
                     } label: {
-                        Label("重试失败 (\(engine.failedCount))", systemImage: "arrow.counterclockwise")
+                        Label("重试可恢复 (\(engine.retryableCount))", systemImage: "arrow.counterclockwise")
                     }
                 }
-                historyButton
-                Button {
-                    engine.checkOnly(options: UpdateOptions(greedy: greedy))
-                } label: {
-                    Label("再次检查", systemImage: "magnifyingglass")
+                if !engine.pendingUpdates.isEmpty {
+                    Button {
+                        engine.upgrade(packages: engine.pendingUpdates, options: UpdateOptions(greedy: greedy))
+                    } label: {
+                        Label("继续待更新 (\(engine.pendingUpdates.count))", systemImage: "play.fill")
+                    }
                 }
-                Button(role: .destructive) {
-                    engine.reset()
-                } label: {
-                    Label("清空", systemImage: "trash")
+                if !engine.tasks.isEmpty || !engine.pendingUpdates.isEmpty {
+                    Button(role: .destructive) {
+                        engine.reset()
+                    } label: {
+                        Label("清空", systemImage: "trash")
+                    }
                 }
             }
         }
@@ -137,7 +125,7 @@ struct UpgradeCenterView: View {
                 Text("待更新包 (\(engine.pendingUpdates.count))")
                     .font(.headline)
                 Spacer()
-                Text("已选择 \(selectedNames.count)")
+                Text("已选择 \(selectedPackageIDs.count)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -148,8 +136,8 @@ struct UpgradeCenterView: View {
                     ForEach(engine.pendingUpdates) { entry in
                         PendingRow(
                             entry: entry,
-                            isSelected: selectedNames.contains(entry.name),
-                            onToggle: { toggleSelection(entry.name) }
+                            isSelected: selectedPackageIDs.contains(entry.identity),
+                            onToggle: { toggleSelection(entry.identity) }
                         )
                     }
                 }
@@ -165,30 +153,30 @@ struct UpgradeCenterView: View {
     private var allSelectedBinding: Binding<Bool> {
         Binding(
             get: {
-                !engine.pendingUpdates.isEmpty && selectedNames.count == engine.pendingUpdates.count
+                !engine.pendingUpdates.isEmpty && selectedPackageIDs.count == engine.pendingUpdates.count
             },
             set: { on in
                 if on {
-                    selectedNames = Set(engine.pendingUpdates.map(\.name))
+                    selectedPackageIDs = Set(engine.pendingUpdates.map(\.identity))
                 } else {
-                    selectedNames = []
+                    selectedPackageIDs = []
                 }
             }
         )
     }
 
-    private func toggleSelection(_ name: String) {
-        if selectedNames.contains(name) {
-            selectedNames.remove(name)
+    private func toggleSelection(_ identity: PackageIdentity) {
+        if selectedPackageIDs.contains(identity) {
+            selectedPackageIDs.remove(identity)
         } else {
-            selectedNames.insert(name)
+            selectedPackageIDs.insert(identity)
         }
     }
 
     /// 底部操作条:"更新所选 (N)" + "全部更新"(绿色边框显眼样式)
     private var actionBar: some View {
         HStack(spacing: 12) {
-            let selected = engine.pendingUpdates.filter { selectedNames.contains($0.name) }
+            let selected = engine.pendingUpdates.filter { selectedPackageIDs.contains($0.identity) }
             Button {
                 engine.upgrade(packages: selected, options: UpdateOptions(greedy: greedy))
             } label: {
@@ -245,6 +233,23 @@ struct UpgradeCenterView: View {
             }
         }
         .padding(.vertical, 8)
+    }
+
+    private var pendingSummaryView: some View {
+        let names = engine.pendingUpdates.map { "\($0.kind == .formula ? "formula" : "cask")/\($0.name)" }
+        return VStack(alignment: .leading, spacing: 3) {
+            Text("仍待更新 \(names.count) 个包")
+                .font(.caption.weight(.semibold))
+            Text(names.joined(separator: "、"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .textSelection(.enabled)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.25))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     /// 事件日志面板(追加式,自动滚底)

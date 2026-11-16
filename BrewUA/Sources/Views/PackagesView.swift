@@ -17,7 +17,7 @@ struct PackagesView: View {
     /// 卸载失败提示(弹窗)
     @State private var uninstallError: String?
     /// 正在卸载中的包名(防重复点击)
-    @State private var uninstallingName: String?
+    @State private var uninstallingID: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -127,8 +127,8 @@ struct PackagesView: View {
             List(filtered) { pkg in
                 PackageRow(
                     package: pkg,
-                    isIgnored: ignoredNames.contains(pkg.name),
-                    isUninstalling: uninstallingName == pkg.name,
+                    isIgnored: ConfigService.isIgnored(name: pkg.name, kind: pkg.kind, rules: ignoredNames),
+                    isUninstalling: uninstallingID == pkg.id,
                     onIgnore: { toggleIgnore(pkg) },
                     onUpgrade: { upgrade(pkg) },
                     onUninstall: { uninstall(pkg) }
@@ -141,7 +141,7 @@ struct PackagesView: View {
     private var filtered: [InstalledPackage] {
         packages
             .filter { kindFilter == nil || $0.kind == kindFilter }
-            .filter { !showIgnoredOnly || ignoredNames.contains($0.name) }
+            .filter { !showIgnoredOnly || ConfigService.isIgnored(name: $0.name, kind: $0.kind, rules: ignoredNames) }
             .filter { searchText.isEmpty || $0.name.localizedCaseInsensitiveContains(searchText) }
             .sorted { $0.kind != $1.kind ? $0.kind == .formula : $0.name < $1.name }
     }
@@ -172,23 +172,24 @@ struct PackagesView: View {
     /// 在升级屏蔽列表中添加/移除该包
     /// 磁盘写入失败时不更新内存状态(避免 UI 与 ~/.config/brew-ua/ignored_casks 不一致)
     private func toggleIgnore(_ pkg: InstalledPackage) {
-        if ignoredNames.contains(pkg.name) {
-            guard (try? config.removeIgnored(pkg.name)) != nil else { return }
-            ignoredNames.remove(pkg.name)
+        let matchingRules = ConfigService.matchingRules(name: pkg.name, kind: pkg.kind, rules: ignoredNames)
+        if !matchingRules.isEmpty {
+            guard (try? config.removeIgnoredMatching(name: pkg.name, kind: pkg.kind)) != nil else { return }
+            ignoredNames.subtract(matchingRules)
         } else {
-            guard (try? config.addIgnored(pkg.name)) != nil else { return }
-            ignoredNames.insert(pkg.name)
+            guard (try? config.addIgnored(pkg.name, kind: pkg.kind)) != nil else { return }
+            ignoredNames.insert(IgnoredPackageRule(kind: pkg.kind, name: pkg.name).storageValue)
         }
     }
 
     private func uninstall(_ pkg: InstalledPackage) {
-        guard uninstallingName == nil else { return } // 防重复点击
-        uninstallingName = pkg.name
+        guard uninstallingID == nil else { return } // 防重复点击
+        uninstallingID = pkg.id
         let name = pkg.name
         Task {
             let flag = pkg.kind == .formula ? "--formula" : "--cask"
             let result = await brew.brewChecked(["uninstall", flag, name])
-            uninstallingName = nil
+            uninstallingID = nil
             if result.success {
                 await load()
             } else {
