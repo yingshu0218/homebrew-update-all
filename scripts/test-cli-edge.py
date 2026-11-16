@@ -70,8 +70,9 @@ if args[0] == "fetch":
         code = (
             "import os,signal,time; from pathlib import Path; "
             "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-            "signal.signal(signal.SIGHUP, signal.SIG_IGN); time.sleep(1.2); "
-            f"Path({str(state / 'fetch-finished')!r}).write_text('descendant survived cancellation')"
+            "signal.signal(signal.SIGHUP, signal.SIG_IGN); "
+            f"Path({str(state / 'fetch-child-ready')!r}).write_text(str(os.getpid())); "
+            "time.sleep(30)"
         )
         child = subprocess.Popen([sys.executable, "-c", code])
         (state / "fetch-child.pid").write_text(str(child.pid))
@@ -264,19 +265,40 @@ class CLIRegressionTests(unittest.TestCase):
                 stdin=subprocess.DEVNULL,
                 stdout=output,
                 stderr=subprocess.STDOUT,
-                env=self.env("cancel-download", BREW_UA_TEST_FORMULAE="fake-a"),
+                env=self.env("cancel-download", BREW_UA_TEST_FORMULAE="fake-a", BREW_UA_FETCH_TIMEOUT="30"),
                 start_new_session=True,
             )
-            deadline = time.monotonic() + 8
-            while time.monotonic() < deadline and not (self.state / "fetch-started").exists():
-                if process.poll() is not None:
-                    break
-                time.sleep(0.05)
-            self.assertTrue((self.state / "fetch-started").exists(), output_path.read_text())
-            process.send_signal(signal.SIGTERM)
-            self.assertEqual(process.wait(timeout=5), 130, output_path.read_text())
-        time.sleep(1.3)
-        self.assertFalse((self.state / "fetch-finished").exists(), "TERM/HUP-ignoring fetch descendant survived cancellation")
+            try:
+                child_ready = self.state / "fetch-child-ready"
+                child_pid = None
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    try:
+                        child_pid = int(child_ready.read_text())
+                        break
+                    except (FileNotFoundError, ValueError):
+                        pass
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(child_pid, output_path.read_text())
+                process.send_signal(signal.SIGTERM)
+                self.assertEqual(process.wait(timeout=5), 130, output_path.read_text())
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+        # The descendant ignores TERM/HUP. Check its actual lifetime after the
+        # CLI's grace period, rather than racing a fixed-delay completion marker.
+        deadline = time.monotonic() + 3
+        while True:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            self.assertLess(time.monotonic(), deadline,
+                            "TERM/HUP-ignoring fetch descendant survived cancellation")
+            time.sleep(0.02)
         self.assertFalse(any(call[0] in {"upgrade", "reinstall"} for call in self.calls()))
 
     def test_signal_waits_for_current_install_then_stops_queue(self):
