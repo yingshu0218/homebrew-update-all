@@ -171,13 +171,17 @@ final class ProcessTests: XCTestCase {
         let lock = NSLock()
         var value: Int64 = 0
         var reported = 0
+        let sampleReported = expectation(description: "polling monitor reports a sample")
         let monitor = PollingMonitor(sample: {
             lock.lock(); defer { lock.unlock() }
             value += 1
             return value
         }, interval: 0.002) { _, _ in
-            lock.lock(); defer { lock.unlock() }
-            reported += 1
+            let firstReport = lock.withLock {
+                reported += 1
+                return reported == 1
+            }
+            if firstReport { sampleReported.fulfill() }
         }
         monitor.start()
         await withTaskGroup(of: Void.self) { group in
@@ -194,6 +198,9 @@ final class ProcessTests: XCTestCase {
                 }
             }
         }
+        // Background samples report asynchronously on the main queue, so finishing
+        // the stress loop does not guarantee that a callback has been delivered.
+        await fulfillment(of: [sampleReported], timeout: 5)
         monitor.stop()
         let finalReported = lock.withLock { reported }
         XCTAssertGreaterThan(finalReported, 0)
